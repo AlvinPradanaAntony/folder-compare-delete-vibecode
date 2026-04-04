@@ -4,16 +4,20 @@ import csv
 import hashlib
 import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import traceback
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from uuid import uuid4
 
 try:
-    from PySide6.QtCore import QAbstractAnimation, QAbstractTableModel, QEasingCurve, QItemSelectionModel, QModelIndex, QPoint, QPropertyAnimation, QParallelAnimationGroup, QRect, QSortFilterProxyModel, QTimer, Qt, Signal
-    from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFocusEvent, QWheelEvent
+    from PySide6.QtCore import QAbstractAnimation, QAbstractTableModel, QEasingCurve, QItemSelectionModel, QModelIndex, QPoint, QPropertyAnimation, QParallelAnimationGroup, QRect, QSize, QSortFilterProxyModel, QTimer, Qt, Signal
+    from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFocusEvent, QIcon, QWheelEvent
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -37,6 +41,7 @@ try:
         QScrollArea,
         QSplitter,
         QStackedLayout,
+        QStackedWidget,
         QTableView,
         QVBoxLayout,
         QWidget,
@@ -46,6 +51,8 @@ except ImportError as exc:
 
 
 APP_TITLE = "Folder Compare & Delete"
+APP_VERSION = "2.1.0"
+APP_DEVELOPER = "Tonzdev"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 BG_COLOR = "#f4f7fb"
 SURFACE = "#ffffff"
@@ -117,6 +124,23 @@ class MatchResult:
         if self.same_name_different_content:
             return "different_content"
         return "only_target"
+
+
+@dataclass
+class HistoryEntry:
+    timestamp: str
+    action: str
+    status: str
+    detail: str
+    tone: str = "info"
+
+
+@dataclass
+class UndoAction:
+    label: str
+    detail: str
+    operations: List[Dict[str, str]] = field(default_factory=list)
+    action_dir: str = ""
 
 
 class ResponsiveTableWidget(QTableView):
@@ -310,6 +334,75 @@ class MatchResultFilterProxyModel(QSortFilterProxyModel):
         ]
         searchable_text = " ".join(haystacks).lower()
         return self.search_text in searchable_text
+
+
+class HistoryTableModel(QAbstractTableModel):
+    HEADERS = ["Waktu", "Aksi", "Status", "Detail"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._rows: List[HistoryEntry] = []
+
+    def set_rows(self, rows: List[HistoryEntry]) -> None:
+        self.beginResetModel()
+        self._rows = list(rows)
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self.HEADERS)
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole) -> Any:
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal and 0 <= section < len(self.HEADERS):
+            return self.HEADERS[section]
+        return section + 1 if orientation == Qt.Vertical else None
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+
+        entry = self._rows[index.row()]
+        display_values = [entry.timestamp, entry.action, entry.status, entry.detail]
+
+        if role == Qt.DisplayRole:
+            return display_values[index.column()]
+        if role == Qt.ToolTipRole:
+            return display_values[index.column()]
+        if role == Qt.TextAlignmentRole:
+            return Qt.AlignVCenter | (Qt.AlignCenter if index.column() in {0, 2} else Qt.AlignLeft)
+        if role == Qt.BackgroundRole:
+            return QBrush(self._tone_background(entry.tone))
+        if role == Qt.ForegroundRole:
+            return QBrush(self._tone_foreground(entry.tone))
+        return None
+
+    @staticmethod
+    def _tone_background(tone: str) -> QColor:
+        palette = {
+            "success": QColor("#eafaf1"),
+            "warning": QColor("#fff7eb"),
+            "error": QColor("#fff0f3"),
+            "info": QColor("#eef4ff"),
+        }
+        return palette.get(tone, QColor("#eef4ff"))
+
+    @staticmethod
+    def _tone_foreground(tone: str) -> QColor:
+        palette = {
+            "success": QColor("#1f6f4a"),
+            "warning": QColor("#8a5a19"),
+            "error": QColor("#9f3143"),
+            "info": QColor("#2d5bca"),
+        }
+        return palette.get(tone, QColor("#2d5bca"))
 
 
 class FolderPathLineEdit(QLineEdit):
@@ -667,7 +760,22 @@ class ErrorOverlayDialog(QDialog):
 class ConfirmOverlayDialog(QDialog):
     confirmRequested = Signal()
 
-    def __init__(self, parent: Optional[QWidget], title: str, summary: str, details: str) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        title: str,
+        summary: str,
+        details: str,
+        *,
+        detail_title: str = "Pratinjau file",
+        confirm_button_text: str = "Ya, Proses Hapus",
+        confirm_footnote: str = "Pastikan Anda sudah meninjau file hijau sebelum melanjutkan proses hapus.",
+        processing_footnote: str = "Penghapusan sedang berjalan. Mohon tunggu sampai proses selesai.",
+        processing_button_text: str = "Memproses",
+        success_title: str = "Penghapusan Berhasil",
+        success_detail_title: str = "Ringkasan hasil",
+        success_footnote: str = "Proses selesai. Anda dapat menutup dialog ini.",
+    ) -> None:
         super().__init__(parent)
         self._blur_target = parent.centralWidget() if isinstance(parent, QMainWindow) else parent
         self._owns_blur_effect = False
@@ -678,7 +786,14 @@ class ConfirmOverlayDialog(QDialog):
         self._blur_effect: Optional[QGraphicsBlurEffect] = None
         self._processing = False
         self._success_mode = False
-        self._confirm_button_text = "Ya, Proses Hapus"
+        self._confirm_button_text = confirm_button_text
+        self._detail_title_text = detail_title
+        self._confirm_footnote_text = confirm_footnote
+        self._processing_footnote_text = processing_footnote
+        self._processing_button_text = processing_button_text
+        self._success_title_text = success_title
+        self._success_detail_title_text = success_detail_title
+        self._success_footnote_text = success_footnote
         self._spinner_frames = ["|", "/", "-", "\\"]
         self._spinner_index = 0
 
@@ -737,7 +852,7 @@ class ConfirmOverlayDialog(QDialog):
         header_row.addWidget(icon_badge, 0, Qt.AlignTop)
         header_row.addLayout(title_wrap, 1)
 
-        detail_label = QLabel("Pratinjau file")
+        detail_label = QLabel(self._detail_title_text)
         self.detail_label = detail_label
         detail_label.setObjectName("ConfirmOverlaySectionTitle")
 
@@ -748,7 +863,7 @@ class ConfirmOverlayDialog(QDialog):
         self.details_box.setPlainText(self._details_text)
         self.details_box.setMinimumHeight(240)
 
-        footnote = QLabel("Pastikan Anda sudah meninjau file hijau sebelum melanjutkan proses hapus.")
+        footnote = QLabel(self._confirm_footnote_text)
         self.footnote_label = footnote
         footnote.setObjectName("ConfirmOverlayFootnote")
         footnote.setProperty("successMode", False)
@@ -1095,14 +1210,14 @@ class ConfirmOverlayDialog(QDialog):
         self.confirm_button.setEnabled(not processing)
 
         if processing:
-            self.footnote_label.setText("Penghapusan sedang berjalan. Mohon tunggu sampai proses selesai.")
+            self.footnote_label.setText(self._processing_footnote_text)
             self._spinner_index = 0
-            self.confirm_button.setText(f"Memproses {self._spinner_frames[self._spinner_index]}")
+            self.confirm_button.setText(f"{self._processing_button_text} {self._spinner_frames[self._spinner_index]}")
             self.spinner_timer.start()
         else:
             self.spinner_timer.stop()
             self.confirm_button.setText(self._confirm_button_text)
-            self.footnote_label.setText("Pastikan Anda sudah meninjau file hijau sebelum melanjutkan proses hapus.")
+            self.footnote_label.setText(self._confirm_footnote_text)
             self.cancel_button.show()
 
     def flush_visual_state(self) -> None:
@@ -1124,7 +1239,7 @@ class ConfirmOverlayDialog(QDialog):
 
     def _advance_spinner(self) -> None:
         self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
-        self.confirm_button.setText(f"Memproses {self._spinner_frames[self._spinner_index]}")
+        self.confirm_button.setText(f"{self._processing_button_text} {self._spinner_frames[self._spinner_index]}")
 
     def show_success_state(self, summary: str, details: str = "") -> None:
         self.spinner_timer.stop()
@@ -1132,14 +1247,14 @@ class ConfirmOverlayDialog(QDialog):
         self._success_mode = True
         self._refresh_theme_state()
 
-        self.title_label.setText("Penghapusan Berhasil")
+        self.title_label.setText(self._success_title_text)
         self.summary_label.setText(summary)
         self.icon_badge.setText("OK")
-        self.detail_label.setText("Ringkasan hasil")
+        self.detail_label.setText(self._success_detail_title_text)
         self.detail_label.setVisible(bool(details))
         self.details_box.setPlainText(details)
         self.details_box.setVisible(bool(details))
-        self.footnote_label.setText("Proses selesai. Anda dapat menutup dialog ini.")
+        self.footnote_label.setText(self._success_footnote_text)
 
         self.cancel_button.hide()
         self.confirm_button.setEnabled(True)
@@ -1659,9 +1774,21 @@ class FolderCompareDeleteApp(QMainWindow):
         self._pending_scan_results: Optional[List[MatchResult]] = None
         self._awaiting_scan_finalize = False
         self._pending_delete_result: Optional[Dict[str, Any]] = None
+        self._pending_transfer_result: Optional[Dict[str, Any]] = None
         self.delete_confirm_dialog: Optional[ConfirmOverlayDialog] = None
+        self.transfer_confirm_dialog: Optional[ConfirmOverlayDialog] = None
         self.delete_processing_dialog: Optional[ProcessingOverlayDialog] = None
+        self.transfer_thread: Optional[threading.Thread] = None
+        self.undo_thread: Optional[threading.Thread] = None
+        self.undo_processing_dialog: Optional[ProcessingOverlayDialog] = None
+        self._pending_undo_result: Optional[Dict[str, Any]] = None
         self._progress_lock = threading.Lock()
+        self.history_entries: List[HistoryEntry] = []
+        self.history_limit = 200
+        self.undo_stack: List[UndoAction] = []
+        self.undo_limit = 20
+        self.undo_root = Path(tempfile.gettempdir()) / "folder_compare_delete_app_undo"
+        self.sidebar_icon_cache_dir = Path(tempfile.gettempdir()) / "folder_compare_delete_sidebar_icons"
 
         self.stat_labels: Dict[str, QLabel] = {}
         self.detail_labels: Dict[str, QLabel] = {}
@@ -1678,6 +1805,7 @@ class FolderCompareDeleteApp(QMainWindow):
         self._reset_detail_panel()
         self._refresh_stats()
         self._update_table_empty_state()
+        self._update_history_empty_state()
         self._set_progress(0, "Siap untuk scan folder.")
 
         self.filter_timer = QTimer(self)
@@ -1690,19 +1818,97 @@ class FolderCompareDeleteApp(QMainWindow):
         self.queue_timer.start(33)
 
         self.show_only_matches_checkbox.toggled.connect(self._on_filter_changed)
+        self.allow_delete_orange_checkbox.toggled.connect(self._on_delete_scope_changed)
+        self.allow_delete_red_checkbox.toggled.connect(self._on_delete_scope_changed)
+        self._update_delete_action_controls()
         self.add_compare_folder_row()
         self.add_compare_folder_row()
+
+    def _build_sidebar(self) -> QWidget:
+        dock = QWidget()
+        dock.setObjectName("SidebarDock")
+        dock_layout = QVBoxLayout(dock)
+        dock_layout.setContentsMargins(0, 8, 0, 8)
+        dock_layout.setSpacing(0)
+        dock_layout.addStretch(1)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(72)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(10, 14, 10, 14)
+        layout.setSpacing(12)
+
+        logo = QLabel("FC")
+        logo.setObjectName("SidebarLogo")
+        logo.setAlignment(Qt.AlignCenter)
+        logo.setFixedSize(44, 44)
+        layout.addWidget(logo, 0, Qt.AlignHCenter)
+        layout.addSpacing(6)
+
+        self.btn_nav_dashboard = QPushButton()
+        self.btn_nav_dashboard.setToolTip("Dashboard")
+        self.btn_nav_dashboard.setObjectName("SidebarButtonActive")
+        self.btn_nav_dashboard.setCursor(Qt.PointingHandCursor)
+        self.btn_nav_dashboard.clicked.connect(lambda: self._switch_page(0))
+        self.btn_nav_dashboard.setFixedSize(44, 44)
+
+        self.btn_nav_history = QPushButton()
+        self.btn_nav_history.setToolTip("Riwayat & Undo")
+        self.btn_nav_history.setObjectName("SidebarButton")
+        self.btn_nav_history.setCursor(Qt.PointingHandCursor)
+        self.btn_nav_history.clicked.connect(lambda: self._switch_page(1))
+        self.btn_nav_history.setFixedSize(44, 44)
+
+        self.btn_nav_trash = QPushButton()
+        self.btn_nav_trash.setToolTip("Trash Internal")
+        self.btn_nav_trash.setObjectName("SidebarButton")
+        self.btn_nav_trash.setCursor(Qt.PointingHandCursor)
+        self.btn_nav_trash.clicked.connect(lambda: self._switch_page(2))
+        self.btn_nav_trash.setFixedSize(44, 44)
+
+        layout.addWidget(self.btn_nav_dashboard, 0, Qt.AlignHCenter)
+        layout.addWidget(self.btn_nav_history, 0, Qt.AlignHCenter)
+        layout.addWidget(self.btn_nav_trash, 0, Qt.AlignHCenter)
+        layout.addStretch(1)
+
+        sidebar_hint = QLabel("NAV")
+        sidebar_hint.setObjectName("SidebarHint")
+        sidebar_hint.setAlignment(Qt.AlignCenter)
+        layout.addWidget(sidebar_hint)
+
+        dock_layout.addWidget(sidebar, 0, Qt.AlignHCenter)
+        dock_layout.addStretch(1)
+
+        self._apply_sidebar_icons(active_index=0)
+        return dock
 
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
+        central.setObjectName("AppShell")
 
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(20, 20, 20, 20)
-        outer.setSpacing(16)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(20, 18, 20, 18)
+        main_layout.setSpacing(18)
 
-        outer.addWidget(self._build_header())
-        outer.addLayout(self._build_stat_cards())
+        main_layout.addWidget(self._build_sidebar())
+
+        content_widget = QWidget()
+        content_widget.setObjectName("AppContent")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(16)
+
+        content_layout.addWidget(self._build_header())
+
+        self.main_stack = QStackedWidget()
+
+        self.page_dashboard = QWidget()
+        page_dash_layout = QVBoxLayout(self.page_dashboard)
+        page_dash_layout.setContentsMargins(0, 0, 0, 0)
+        page_dash_layout.setSpacing(16)
+        page_dash_layout.addLayout(self._build_stat_cards())
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setObjectName("MainSplitter")
@@ -1711,7 +1917,45 @@ class FolderCompareDeleteApp(QMainWindow):
         self.main_splitter.addWidget(self._build_left_panel())
         self.main_splitter.addWidget(self._build_right_panel())
         self.main_splitter.setSizes([420, 1080])
-        outer.addWidget(self.main_splitter, 1)
+        page_dash_layout.addWidget(self.main_splitter, 1)
+
+        self.main_stack.addWidget(self.page_dashboard)
+
+        self.page_history = QWidget()
+        page_hist_layout = QVBoxLayout(self.page_history)
+        page_hist_layout.setContentsMargins(0, 0, 0, 0)
+
+        history_card = QFrame()
+        history_card.setObjectName("SurfaceCard")
+        history_layout = QVBoxLayout(history_card)
+        history_layout.setContentsMargins(24, 24, 24, 24)
+        history_layout.addWidget(self._build_history_panel())
+        
+        page_hist_layout.addWidget(history_card, 1)
+        self.main_stack.addWidget(self.page_history)
+
+        self.page_trash = QWidget()
+        page_trash_layout = QVBoxLayout(self.page_trash)
+        page_trash_layout.setContentsMargins(0, 0, 0, 0)
+        
+        trash_card = QFrame()
+        trash_card.setObjectName("SurfaceCard")
+        trash_layout = QVBoxLayout(trash_card)
+        trash_layout.setContentsMargins(24, 24, 24, 24)
+        
+        trash_title = QLabel("Trash Internal Aplikasi (File Terhapus)")
+        trash_title.setObjectName("SectionTitle")
+        trash_layout.addWidget(trash_title)
+        
+        trash_desc = QLabel("File yang Anda hapus pada mode Trash Internal akan dipindahkan ke tempat penampungan sementara ini. Anda bisa me-restore fitur tersebut menggunakan tombol Undo, atau mengosongkan trash dari sini.")
+        trash_desc.setWordWrap(True)
+        trash_layout.addWidget(trash_desc)
+        trash_layout.addStretch(1)
+        
+        page_trash_layout.addWidget(trash_card, 1)
+        self.main_stack.addWidget(self.page_trash)
+
+        content_layout.addWidget(self.main_stack, 1)
 
         footer = QFrame()
         footer.setObjectName("FooterBar")
@@ -1721,10 +1965,36 @@ class FolderCompareDeleteApp(QMainWindow):
 
         self.status_label = QLabel("Siap untuk scan folder.")
         self.status_label.setObjectName("FooterLabel")
-        self.status_label.setWordWrap(True)
+        self.status_label.setWordWrap(False)
         footer_layout.addWidget(self.status_label)
 
-        outer.addWidget(footer)
+        footer_layout.addStretch(1)
+
+        self.footer_meta_label = QLabel(f"Developed by {APP_DEVELOPER}  |  v{APP_VERSION}")
+        self.footer_meta_label.setObjectName("FooterMetaLabel")
+        footer_layout.addWidget(self.footer_meta_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        content_layout.addWidget(footer)
+        main_layout.addWidget(content_widget, 1)
+
+    def _switch_page(self, index: int) -> None:
+        self.main_stack.setCurrentIndex(index)
+        
+        self.btn_nav_dashboard.setObjectName("SidebarButton")
+        self.btn_nav_history.setObjectName("SidebarButton")
+        self.btn_nav_trash.setObjectName("SidebarButton")
+
+        if index == 0:
+            self.btn_nav_dashboard.setObjectName("SidebarButtonActive")
+        elif index == 1:
+            self.btn_nav_history.setObjectName("SidebarButtonActive")
+        elif index == 2:
+            self.btn_nav_trash.setObjectName("SidebarButtonActive")
+            
+        self._refresh_widget_style(self.btn_nav_dashboard)
+        self._refresh_widget_style(self.btn_nav_history)
+        self._refresh_widget_style(self.btn_nav_trash)
+        self._apply_sidebar_icons(active_index=index)
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -1757,6 +2027,9 @@ class FolderCompareDeleteApp(QMainWindow):
         title = QLabel("Folder Compare Delete")
         title.setObjectName("HeaderTitle")
 
+        header_meta = QLabel(f"Version {APP_VERSION}  |  Developed by {APP_DEVELOPER}")
+        header_meta.setObjectName("HeaderMeta")
+
         subtitle = QLabel(
             "Bandingkan isi beberapa folder, identifikasi duplikat dan perbedaan secara visual, lalu proses file dari Folder A dengan lebih aman."
         )
@@ -1772,6 +2045,7 @@ class FolderCompareDeleteApp(QMainWindow):
 
         text_group.addWidget(eyebrow)
         text_group.addWidget(title)
+        text_group.addWidget(header_meta)
         text_group.addWidget(subtitle)
         text_group.addLayout(meta_row)
 
@@ -2050,6 +2324,11 @@ class FolderCompareDeleteApp(QMainWindow):
         self.delete_mode_recycle = QRadioButton("Hapus ke Recycle Bin")
         self.delete_mode_permanent = QRadioButton("Hapus permanen")
         self.delete_mode_recycle.setChecked(True)
+        self.allow_delete_orange_checkbox = QCheckBox("Izinkan hapus hasil oranye (hanya di Folder A)")
+        self.allow_delete_red_checkbox = QCheckBox("Izinkan hapus hasil merah (nama sama, isi berbeda)")
+        self.delete_scope_hint_label = QLabel("Default aman: hanya hasil hijau yang dapat dihapus.")
+        self.delete_scope_hint_label.setObjectName("MutedText")
+        self.delete_scope_hint_label.setWordWrap(True)
 
         self.delete_mode_group = QButtonGroup(self)
         self.delete_mode_group.addButton(self.delete_mode_recycle)
@@ -2061,6 +2340,10 @@ class FolderCompareDeleteApp(QMainWindow):
         extra_layout.addSpacing(6)
         extra_layout.addWidget(self.delete_mode_recycle)
         extra_layout.addWidget(self.delete_mode_permanent)
+        extra_layout.addSpacing(6)
+        extra_layout.addWidget(self.allow_delete_orange_checkbox)
+        extra_layout.addWidget(self.allow_delete_red_checkbox)
+        extra_layout.addWidget(self.delete_scope_hint_label)
 
         layout.addWidget(method_card)
         layout.addWidget(extra_card)
@@ -2109,14 +2392,31 @@ class FolderCompareDeleteApp(QMainWindow):
         second_row.addWidget(self.delete_button)
         second_row.addWidget(self.delete_all_button)
 
+        third_row = QHBoxLayout()
+        third_row.setSpacing(8)
+
+        self.copy_button = QPushButton("Salin Terpilih")
+        self.copy_button.setObjectName("GhostButton")
+        self.copy_button.clicked.connect(lambda: self.transfer_selected_files("copy"))
+
+        self.move_button = QPushButton("Pindah Terpilih")
+        self.move_button.setObjectName("OutlineButton")
+        self.move_button.clicked.connect(lambda: self.transfer_selected_files("move"))
+
+        third_row.addWidget(self.copy_button)
+        third_row.addWidget(self.move_button)
+
         layout.addWidget(self.scan_button)
         layout.addLayout(first_row)
         layout.addLayout(second_row)
+        layout.addLayout(third_row)
 
         self.export_csv_button.setEnabled(False)
         self.export_excel_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.delete_all_button.setEnabled(False)
+        self.copy_button.setEnabled(False)
+        self.move_button.setEnabled(False)
         return card
 
     def _build_right_panel(self) -> QWidget:
@@ -2224,6 +2524,7 @@ class FolderCompareDeleteApp(QMainWindow):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setObjectName("FilterChip")
+            button.setProperty("chipKey", key)
             button.setProperty("chipColor", color)
             button.clicked.connect(self._on_filter_changed)
             self.quick_filter_group.addButton(button)
@@ -2375,9 +2676,133 @@ class FolderCompareDeleteApp(QMainWindow):
             row, column = positions[key]
             grid.addWidget(self._create_detail_card(key, title_text), row, column)
 
+        self.missing_compare_suggestion = QFrame()
+        self.missing_compare_suggestion.setObjectName("SuggestionCard")
+        self.missing_compare_suggestion.setVisible(False)
+        suggestion_layout = QHBoxLayout(self.missing_compare_suggestion)
+        suggestion_layout.setContentsMargins(14, 12, 14, 12)
+        suggestion_layout.setSpacing(12)
+
+        self.missing_compare_suggestion_label = QLabel("")
+        self.missing_compare_suggestion_label.setObjectName("SuggestionText")
+        self.missing_compare_suggestion_label.setWordWrap(True)
+
+        self.missing_compare_copy_button = QPushButton("Salin ke Folder Pembanding")
+        self.missing_compare_copy_button.setObjectName("GhostButton")
+        self.missing_compare_copy_button.clicked.connect(self.copy_to_compare_folders)
+
+        self.missing_compare_move_button = QPushButton("Pindah ke Folder Pembanding")
+        self.missing_compare_move_button.setObjectName("OutlineButton")
+        self.missing_compare_move_button.clicked.connect(self.move_to_compare_folders)
+
+        suggestion_layout.addWidget(self.missing_compare_suggestion_label, 1)
+        suggestion_layout.addWidget(self.missing_compare_copy_button, 0)
+        suggestion_layout.addWidget(self.missing_compare_move_button, 0)
+
         layout.addLayout(top)
         layout.addLayout(grid)
+        layout.addWidget(self.missing_compare_suggestion)
         return card
+
+    def _build_history_panel(self) -> QWidget:
+        card = QFrame()
+        card.setObjectName("SubCard")
+        card.setMinimumHeight(260)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+
+        title = QLabel("Riwayat Aksi")
+        title.setObjectName("FieldLabel")
+
+        self.history_count_badge = QLabel("0 aksi")
+        self.history_count_badge.setObjectName("HistoryCountBadge")
+        self.history_count_badge.setAlignment(Qt.AlignCenter)
+
+        self.undo_button = QPushButton("Undo Terakhir")
+        self.undo_button.setObjectName("GhostButton")
+        self.undo_button.clicked.connect(self.undo_last_action)
+        self.undo_button.setEnabled(False)
+
+        self.clear_history_button = QPushButton("Bersihkan")
+        self.clear_history_button.setObjectName("OutlineButton")
+        self.clear_history_button.clicked.connect(self.clear_history)
+        self.clear_history_button.setEnabled(False)
+
+        top.addWidget(title)
+        top.addStretch(1)
+        top.addWidget(self.history_count_badge)
+        top.addWidget(self.undo_button)
+        top.addWidget(self.clear_history_button)
+
+        self.history_stack_host = QWidget()
+        self.history_stack = QStackedLayout(self.history_stack_host)
+        self.history_stack.setContentsMargins(0, 0, 0, 0)
+        self.history_stack.setStackingMode(QStackedLayout.StackOne)
+
+        self.history_table = QTableView()
+        self.history_table.setObjectName("HistoryTable")
+        self.history_model = HistoryTableModel()
+        self.history_table.setModel(self.history_model)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setAlternatingRowColors(False)
+        self.history_table.setWordWrap(False)
+        self.history_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.history_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.history_table.setTextElideMode(Qt.ElideRight)
+        self.history_table.setShowGrid(True)
+        self.history_table.setSortingEnabled(False)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.verticalHeader().setDefaultSectionSize(34)
+        self.history_table.setMinimumHeight(220)
+
+        history_header = self.history_table.horizontalHeader()
+        history_header.setStretchLastSection(False)
+        history_header.setMinimumSectionSize(90)
+        history_header.setSectionsMovable(False)
+        for column in range(self.history_model.columnCount()):
+            history_header.setSectionResizeMode(column, QHeaderView.Interactive)
+
+        self.history_table.setColumnWidth(0, 145)
+        self.history_table.setColumnWidth(1, 180)
+        self.history_table.setColumnWidth(2, 100)
+        self.history_table.setColumnWidth(3, 520)
+
+        self.history_empty_state = self._build_history_empty_state()
+        self.history_stack.addWidget(self.history_table)
+        self.history_stack.addWidget(self.history_empty_state)
+
+        layout.addLayout(top)
+        layout.addWidget(self.history_stack_host)
+        return card
+
+    def _build_history_empty_state(self) -> QWidget:
+        empty = QFrame()
+        empty.setObjectName("HistoryEmptyState")
+        layout = QVBoxLayout(empty)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignCenter)
+
+        title = QLabel("Belum ada riwayat aksi")
+        title.setObjectName("HistoryEmptyTitle")
+        title.setAlignment(Qt.AlignCenter)
+
+        description = QLabel(
+            "Riwayat scan, hapus, salin, pindah, export, dan aksi penting lainnya akan muncul di sini."
+        )
+        description.setObjectName("HistoryEmptyDescription")
+        description.setAlignment(Qt.AlignCenter)
+        description.setWordWrap(True)
+
+        layout.addWidget(title)
+        layout.addWidget(description)
+        return empty
 
     def _create_detail_card(self, key: str, title: str) -> QWidget:
         card = QFrame()
@@ -2450,6 +2875,31 @@ class FolderCompareDeleteApp(QMainWindow):
     def _stylesheet_url(self, path: Path) -> str:
         return path.resolve().as_posix()
 
+    def _sidebar_icon_variant(self, source_name: str, color: str) -> Path:
+        source_path = Path(__file__).with_name(source_name)
+        self.sidebar_icon_cache_dir.mkdir(parents=True, exist_ok=True)
+        variant_path = self.sidebar_icon_cache_dir / f"{source_path.stem}_{color.strip('#')}.svg"
+        try:
+            svg_text = source_path.read_text(encoding="utf-8")
+            tinted_text = svg_text.replace("currentColor", color)
+            if not variant_path.exists() or variant_path.read_text(encoding="utf-8") != tinted_text:
+                variant_path.write_text(tinted_text, encoding="utf-8")
+        except Exception:
+            return source_path
+        return variant_path
+
+    def _apply_sidebar_icons(self, active_index: int) -> None:
+        icon_specs = [
+            (self.btn_nav_dashboard, "dashboard.svg", active_index == 0),
+            (self.btn_nav_history, "history.svg", active_index == 1),
+            (self.btn_nav_trash, "trash-can.svg", active_index == 2),
+        ]
+        for button, source_name, is_active in icon_specs:
+            color = "#ffffff" if is_active else "#8ea0c3"
+            icon_path = self._sidebar_icon_variant(source_name, color)
+            button.setIcon(QIcon(str(icon_path)))
+            button.setIconSize(QSize(18, 18))
+
     def _apply_styles(self) -> None:
         checkbox_check_url = self._stylesheet_url(Path(__file__).with_name("checkbox_check.svg"))
         sort_up_url = self._stylesheet_url(Path(__file__).with_name("sort_up.svg"))
@@ -2459,6 +2909,12 @@ class FolderCompareDeleteApp(QMainWindow):
             QMainWindow {{
                 background: {BG_COLOR};
                 color: {TEXT};
+            }}
+            QWidget#AppShell {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f4f7fb, stop:1 #eef4ff);
+            }}
+            QWidget#AppContent {{
+                background: transparent;
             }}
             QLabel {{
                 color: {TEXT};
@@ -2486,6 +2942,11 @@ class FolderCompareDeleteApp(QMainWindow):
                 color: white;
                 font: 700 24pt "Segoe UI Semibold";
                 letter-spacing: 0.3px;
+            }}
+            QLabel#HeaderMeta {{
+                color: rgba(236, 243, 255, 0.88);
+                font: 600 9.5pt "Segoe UI";
+                letter-spacing: 0.2px;
             }}
             QLabel#HeaderSubtitle {{
                 color: rgba(242, 246, 255, 0.92);
@@ -2641,6 +3102,62 @@ class FolderCompareDeleteApp(QMainWindow):
                 color: {PRIMARY};
                 border: 1px solid #aecaef;
             }}
+            QPushButton#FilterChip[chipKey="all"] {{
+                background: #f6f9ff;
+                color: #315cc9;
+                border: 1px solid #cfdcf6;
+            }}
+            QPushButton#FilterChip[chipKey="all"]:hover {{
+                background: #edf3ff;
+                border: 1px solid #bdd0f4;
+            }}
+            QPushButton#FilterChip[chipKey="all"]:checked {{
+                background: #e7efff;
+                color: #1f5eff;
+                border: 1px solid #9fbdf0;
+            }}
+            QPushButton#FilterChip[chipKey="exact_match"] {{
+                background: #f4fcf8;
+                color: #1f7a58;
+                border: 1px solid #cdebdc;
+            }}
+            QPushButton#FilterChip[chipKey="exact_match"]:hover {{
+                background: #ebfaf2;
+                border: 1px solid #b4e2cc;
+            }}
+            QPushButton#FilterChip[chipKey="exact_match"]:checked {{
+                background: #dff7ea;
+                color: #156746;
+                border: 1px solid #8fd0b0;
+            }}
+            QPushButton#FilterChip[chipKey="different_content"] {{
+                background: #fff5f7;
+                color: #b23a50;
+                border: 1px solid #f4ccd5;
+            }}
+            QPushButton#FilterChip[chipKey="different_content"]:hover {{
+                background: #ffedf1;
+                border: 1px solid #efb8c4;
+            }}
+            QPushButton#FilterChip[chipKey="different_content"]:checked {{
+                background: #ffe2e9;
+                color: #982c42;
+                border: 1px solid #e79aaa;
+            }}
+            QPushButton#FilterChip[chipKey="only_target"] {{
+                background: #fff8ef;
+                color: #b56b18;
+                border: 1px solid #f4dcc0;
+            }}
+            QPushButton#FilterChip[chipKey="only_target"]:hover {{
+                background: #fff1df;
+                border: 1px solid #efcba1;
+            }}
+            QPushButton#FilterChip[chipKey="only_target"]:checked {{
+                background: #ffe8c8;
+                color: #99540c;
+                border: 1px solid #e5b06d;
+            }}
             QPushButton#DangerButton {{
                 background: #fff0f3;
                 color: #9d263a;
@@ -2648,6 +3165,16 @@ class FolderCompareDeleteApp(QMainWindow):
             }}
             QPushButton#DangerButton:hover {{
                 background: #ffe5eb;
+            }}
+            QFrame#SuggestionCard {{
+                background: #f4fbf7;
+                border: 1px solid #d6ecdf;
+                border-radius: 16px;
+            }}
+            QLabel#SuggestionText {{
+                color: #23583f;
+                font: 9.5pt "Segoe UI";
+                line-height: 1.35;
             }}
             QPushButton:disabled {{
                 background: #f0f3f8;
@@ -2700,6 +3227,45 @@ class FolderCompareDeleteApp(QMainWindow):
                     stop: 1 #f7faff
                 );
                 border: 1px solid #2d64f1;
+            }}
+            QWidget#SidebarDock {{
+                background: transparent;
+            }}
+            QFrame#Sidebar {{
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #15233f, stop:1 #0e1930);
+                border: 1px solid rgba(130, 155, 208, 0.18);
+                border-radius: 24px;
+            }}
+            QLabel#SidebarLogo {{
+                color: #ffffff;
+                font: 900 13pt "Segoe UI";
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 #3f86ff, stop: 1 #1f5eff);
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                border-radius: 14px;
+                padding: 4px;
+            }}
+            QLabel#SidebarHint {{
+                color: rgba(214, 226, 248, 0.58);
+                font: 700 7pt "Segoe UI";
+                letter-spacing: 1.4px;
+            }}
+            QPushButton#SidebarButton {{
+                background: rgba(255, 255, 255, 0.04);
+                border: 1px solid transparent;
+                border-radius: 14px;
+                color: #cbd5e1;
+                padding: 0;
+            }}
+            QPushButton#SidebarButton:hover {{
+                background: rgba(255, 255, 255, 0.09);
+                border: 1px solid rgba(173, 194, 232, 0.14);
+            }}
+            QPushButton#SidebarButtonActive {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2aa8d8, stop:1 #1f5eff);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 14px;
+                color: #ffffff;
+                padding: 0;
             }}
             QProgressBar {{
                 background: #edf2fb;
@@ -2780,6 +3346,11 @@ class FolderCompareDeleteApp(QMainWindow):
                 border: 1px dashed #cdd9ee;
                 border-radius: 16px;
             }}
+            QFrame#HistoryEmptyState {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #fbfdff, stop:1 #f7faff);
+                border: 1px dashed #d4def1;
+                border-radius: 16px;
+            }}
             QLabel#EmptyStateIcon {{
                 color: #8eabdd;
                 font: 700 22pt "Consolas";
@@ -2793,6 +3364,14 @@ class FolderCompareDeleteApp(QMainWindow):
                 color: {MUTED};
                 font: 9.5pt "Segoe UI";
             }}
+            QLabel#HistoryEmptyTitle {{
+                color: {TEXT};
+                font: 700 12pt "Segoe UI Semibold";
+            }}
+            QLabel#HistoryEmptyDescription {{
+                color: {MUTED};
+                font: 9.2pt "Segoe UI";
+            }}
             QLabel#DetailTitle {{
                 color: {MUTED};
                 font: 700 9pt "Segoe UI";
@@ -2800,6 +3379,17 @@ class FolderCompareDeleteApp(QMainWindow):
             QLabel#DetailValue {{
                 color: {TEXT};
                 font: 9pt "Segoe UI";
+            }}
+            QLabel#HistoryCountBadge {{
+                background: #edf3ff;
+                color: {PRIMARY};
+                border-radius: 12px;
+                font: 700 9pt "Segoe UI";
+                padding: 4px 10px;
+                min-width: 58px;
+            }}
+            QTableView#HistoryTable {{
+                border-radius: 14px;
             }}
             QLabel#PathStatus {{
                 font: 8.8pt "Segoe UI";
@@ -2818,6 +3408,10 @@ class FolderCompareDeleteApp(QMainWindow):
             QLabel#FooterLabel {{
                 color: #edf2ff;
                 font: 9.5pt "Segoe UI";
+            }}
+            QLabel#FooterMetaLabel {{
+                color: rgba(237, 242, 255, 0.72);
+                font: 600 9pt "Segoe UI";
             }}
             QScrollArea {{
                 background: transparent;
@@ -3005,6 +3599,17 @@ class FolderCompareDeleteApp(QMainWindow):
         with self._progress_lock:
             self._pending_progress = None
         self._set_progress(0, "Memulai scan folder...")
+        self._record_history(
+            "Scan dan bandingkan",
+            "Diproses",
+            (
+                f"Folder A: {target_folder}\n"
+                f"Folder pembanding: {len(compare_folders)} folder\n"
+                f"Mode: {'hash+ukuran' if self._current_compare_mode() == 'hash' else 'nama+ukuran'}\n"
+                f"Subfolder: {'ya' if self.include_subfolders_checkbox.isChecked() else 'tidak'}"
+            ),
+            "info",
+        )
 
         self.scan_thread = threading.Thread(
             target=self._scan_worker,
@@ -3024,19 +3629,98 @@ class FolderCompareDeleteApp(QMainWindow):
     def _current_delete_mode(self) -> str:
         return "permanent" if self.delete_mode_permanent.isChecked() else "recycle_bin"
 
+    def _is_result_deletable(self, result: MatchResult) -> bool:
+        if result.exact_matches:
+            return True
+        if result.same_name_different_content:
+            return self.allow_delete_red_checkbox.isChecked()
+        if result.only_in_target:
+            return self.allow_delete_orange_checkbox.isChecked()
+        return False
+
+    def _deletable_results(self) -> List[MatchResult]:
+        return [row for row in self.result_rows if self._is_result_deletable(row)]
+
+    def _deletable_result_count(self) -> int:
+        return len(self._deletable_results())
+
+    def _delete_scope_counts(self, rows: List[MatchResult]) -> Dict[str, int]:
+        counts = {"exact_match": 0, "different_content": 0, "only_target": 0}
+        for row in rows:
+            counts[row.tree_tag] = counts.get(row.tree_tag, 0) + 1
+        return counts
+
+    def _delete_scope_text(self) -> str:
+        labels = ["hijau"]
+        if self.allow_delete_orange_checkbox.isChecked():
+            labels.append("oranye")
+        if self.allow_delete_red_checkbox.isChecked():
+            labels.append("merah")
+        return ", ".join(labels)
+
+    def _update_delete_action_controls(self, deleting: bool = False) -> None:
+        advanced_scope = self.allow_delete_orange_checkbox.isChecked() or self.allow_delete_red_checkbox.isChecked()
+        self.delete_all_button.setText("Hapus Semua Sesuai Opsi" if advanced_scope else "Hapus Semua Hijau")
+
+        if advanced_scope:
+            self.delete_scope_hint_label.setText(
+                "Mode hapus lanjutan aktif. Periksa ulang hasil merah/oranye sebelum menghapus."
+            )
+        else:
+            self.delete_scope_hint_label.setText("Default aman: hanya hasil hijau yang dapat dihapus.")
+
+        has_deletable = self._deletable_result_count() > 0
+        self.delete_button.setEnabled(not deleting and has_deletable)
+        self.delete_all_button.setEnabled(not deleting and has_deletable)
+
+    def _update_transfer_action_controls(self, operating: bool = False) -> None:
+        has_results = bool(self.result_rows)
+        self.copy_button.setEnabled(not operating and has_results)
+        self.move_button.setEnabled(not operating and has_results)
+
+    def _on_delete_scope_changed(self) -> None:
+        if self.scan_thread and self.scan_thread.is_alive():
+            return
+        self._update_delete_action_controls(deleting=bool(self.delete_thread and self.delete_thread.is_alive()))
+        if self.result_rows:
+            self.status_label.setText(f"Opsi hapus diperbarui. Kategori aktif: {self._delete_scope_text()}.")
+
     def _set_action_state(self, scanning: bool) -> None:
         self.scan_button.setEnabled(not scanning)
         self.export_csv_button.setEnabled(False)
         self.export_excel_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.delete_all_button.setEnabled(False)
+        self.copy_button.setEnabled(False)
+        self.move_button.setEnabled(False)
 
     def _set_delete_processing_state(self, deleting: bool) -> None:
         self.scan_button.setEnabled(not deleting)
         self.export_csv_button.setEnabled(not deleting and bool(self.result_rows))
         self.export_excel_button.setEnabled(not deleting and bool(self.result_rows) and self.openpyxl_available)
-        self.delete_button.setEnabled(not deleting and any(row.exact_matches for row in self.result_rows))
-        self.delete_all_button.setEnabled(not deleting and any(row.exact_matches for row in self.result_rows))
+        self._update_delete_action_controls(deleting=deleting)
+        self._update_transfer_action_controls(operating=deleting or bool(self.transfer_thread and self.transfer_thread.is_alive()))
+
+    def _set_transfer_processing_state(self, transferring: bool) -> None:
+        self.scan_button.setEnabled(not transferring and not (self.delete_thread and self.delete_thread.is_alive()))
+        self.export_csv_button.setEnabled(not transferring and bool(self.result_rows))
+        self.export_excel_button.setEnabled(not transferring and bool(self.result_rows) and self.openpyxl_available)
+        self._update_delete_action_controls(
+            deleting=transferring or bool(self.delete_thread and self.delete_thread.is_alive())
+        )
+        self._update_transfer_action_controls(operating=transferring)
+
+    def _set_undo_processing_state(self, undoing: bool) -> None:
+        has_results = bool(self.result_rows)
+        self.scan_button.setEnabled(not undoing)
+        self.export_csv_button.setEnabled(not undoing and has_results)
+        self.export_excel_button.setEnabled(not undoing and has_results and self.openpyxl_available)
+        self._update_delete_action_controls(
+            deleting=undoing or bool(self.delete_thread and self.delete_thread.is_alive())
+        )
+        self._update_transfer_action_controls(
+            operating=undoing or bool(self.transfer_thread and self.transfer_thread.is_alive())
+        )
 
     def _scan_worker(self, target_folder: str, compare_folders: List[str], mode: str, include_subfolders: bool) -> None:
         try:
@@ -3397,12 +4081,24 @@ class FolderCompareDeleteApp(QMainWindow):
             self._set_progress(0, "Terjadi kesalahan saat scan.")
             self.progress_card.setVisible(False)
             if isinstance(payload, dict):
+                self._record_history(
+                    "Scan dan bandingkan",
+                    "Gagal",
+                    str(payload.get("summary", "Terjadi kesalahan saat scan.")),
+                    "error",
+                )
                 self.show_error_dialog(
                     str(payload.get("title", APP_TITLE)),
                     str(payload.get("summary", "Terjadi kesalahan saat scan.")),
                     str(payload.get("details", payload.get("summary", ""))),
                 )
             else:
+                self._record_history(
+                    "Scan dan bandingkan",
+                    "Gagal",
+                    str(payload),
+                    "error",
+                )
                 self.show_error_dialog(
                     "Terjadi kesalahan saat scan dan bandingkan",
                     str(payload),
@@ -3413,6 +4109,16 @@ class FolderCompareDeleteApp(QMainWindow):
         if kind == "delete_done":
             self._pending_delete_result = payload if isinstance(payload, dict) else {}
             QTimer.singleShot(0, self._finalize_delete_results)
+            return
+
+        if kind == "transfer_done":
+            self._pending_transfer_result = payload if isinstance(payload, dict) else {}
+            QTimer.singleShot(0, self._finalize_transfer_results)
+            return
+
+        if kind == "undo_done":
+            self._pending_undo_result = payload if isinstance(payload, dict) else {}
+            QTimer.singleShot(0, self._finalize_undo_results)
             return
 
     def _on_progress_animation_finished(self) -> None:
@@ -3443,19 +4149,31 @@ class FolderCompareDeleteApp(QMainWindow):
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.progress_badge.setText("100%")
         self.status_label.setText("Scan selesai. Data siap dianalisis.")
+        self._record_history(
+            "Scan dan bandingkan",
+            "Sukses",
+            (
+                f"Total hasil: {len(self.result_rows)}\n"
+                f"Duplikat: {sum(1 for row in self.result_rows if row.exact_matches)}\n"
+                f"Berbeda: {sum(1 for row in self.result_rows if row.same_name_different_content)}\n"
+                f"Hanya di A: {sum(1 for row in self.result_rows if row.only_in_target)}"
+            ),
+            "success",
+        )
         self.export_csv_button.setEnabled(True)
         if self.openpyxl_available:
             self.export_excel_button.setEnabled(True)
+        self._update_transfer_action_controls()
 
-        duplicate_count = sum(1 for row in self.result_rows if row.exact_matches)
-        if duplicate_count > 0:
-            self.delete_button.setEnabled(True)
-            self.delete_all_button.setEnabled(True)
+        deletable_count = self._deletable_result_count()
+        if deletable_count > 0:
+            self._update_delete_action_controls()
         else:
+            self._update_delete_action_controls()
             QMessageBox.information(
                 self,
                 APP_TITLE,
-                "Tidak ada file duplikat hijau untuk dihapus. Silakan cek hasil merah/oranye.",
+                "Tidak ada hasil yang sesuai dengan izin hapus saat ini. Aktifkan opsi merah/oranye bila memang ingin menghapus kategori tersebut.",
             )
 
         QTimer.singleShot(40, self._finalize_table_layout_after_scan)
@@ -3472,6 +4190,7 @@ class FolderCompareDeleteApp(QMainWindow):
         deleted_paths = [Path(path) for path in payload_map.get("deleted_paths", [])]
         deleted_count = int(payload_map.get("deleted_count", len(deleted_paths)))
         errors = [str(item) for item in payload_map.get("errors", [])]
+        undo_payload = payload_map.get("undo_action") if isinstance(payload_map.get("undo_action"), dict) else None
         active_delete_dialog = self.delete_confirm_dialog
 
         if active_delete_dialog is not None and not errors:
@@ -3497,6 +4216,13 @@ class FolderCompareDeleteApp(QMainWindow):
             QTimer.singleShot(40, self._finalize_table_layout_after_delete)
 
         if errors:
+            self._record_history(
+                "Penghapusan file",
+                "Sebagian gagal" if deleted_count > 0 else "Gagal",
+                f"Berhasil: {deleted_count} | Gagal: {len(errors)}",
+                "warning" if deleted_count > 0 else "error",
+            )
+            self._push_undo_action(undo_payload)
             if active_delete_dialog is not None:
                 active_delete_dialog.force_close(QDialog.Rejected)
                 self.delete_confirm_dialog = None
@@ -3512,6 +4238,13 @@ class FolderCompareDeleteApp(QMainWindow):
         else:
             success_summary = f"Berhasil memproses {deleted_count} file dari Folder A."
             success_details = f"Jumlah file diproses: {deleted_count}\nSisa hasil terlihat: {remaining}"
+            self._record_history(
+                "Penghapusan file",
+                "Sukses",
+                f"Jumlah file diproses: {deleted_count} | Sisa hasil terlihat: {remaining}",
+                "success",
+            )
+            self._push_undo_action(undo_payload)
             if active_delete_dialog is not None:
                 active_delete_dialog.show_success_state(success_summary, success_details)
                 active_delete_dialog.flush_visual_state()
@@ -3525,6 +4258,179 @@ class FolderCompareDeleteApp(QMainWindow):
     def _finalize_table_layout_after_delete(self) -> None:
         if self.result_rows and self.table_proxy.rowCount() > 0:
             self._apply_responsive_column_widths()
+
+    def _finalize_transfer_results(self) -> None:
+        payload_map = self._pending_transfer_result or {}
+        self._pending_transfer_result = None
+
+        operation = str(payload_map.get("operation", "copy"))
+        processed_count = int(payload_map.get("processed_count", 0))
+        error_count = int(payload_map.get("error_count", 0))
+        destination_root = str(payload_map.get("destination_root", ""))
+        errors = [str(item) for item in payload_map.get("errors", [])]
+        undo_payload = payload_map.get("undo_action") if isinstance(payload_map.get("undo_action"), dict) else None
+        active_transfer_dialog = self.transfer_confirm_dialog
+        self.transfer_confirm_dialog = None
+
+        self.transfer_thread = None
+        self._set_transfer_processing_state(False)
+        self._refresh_missing_compare_suggestion(self.current_selected_result)
+
+        if operation in {"copy_compare_sync", "move_compare_sync"}:
+            operation_label = "dipindahkan" if operation == "move_compare_sync" else "disalin"
+            if processed_count > 0:
+                self.clear_results(reset_status=False)
+                self.status_label.setText(
+                    "Folder pembanding berubah. Hasil scan dibersihkan agar Anda dapat menjalankan scan ulang."
+                )
+            if errors:
+                self._record_history(
+                    "Sinkronisasi folder pembanding",
+                    "Sebagian gagal" if processed_count > 0 else "Gagal",
+                    f"Berhasil: {processed_count} | Gagal: {error_count} | Target: {destination_root or '-'}",
+                    "warning" if processed_count > 0 else "error",
+                )
+                self._push_undo_action(undo_payload)
+                if active_transfer_dialog is not None:
+                    active_transfer_dialog.force_close(QDialog.Rejected)
+                self.show_error_dialog(
+                    "Sinkronisasi Folder Pembanding Belum Selesai",
+                    f"{processed_count} file berhasil {operation_label}, {error_count} file gagal diproses.",
+                    (
+                        f"Path relatif: {payload_map.get('relative_path', '-')}{os.linesep}"
+                        f"Folder pembanding target: {destination_root or '-'}{os.linesep}{os.linesep}"
+                        f"{os.linesep.join(errors[:10])}"
+                    ),
+                )
+                return
+
+            success_summary = f"{processed_count} file berhasil {operation_label} ke folder pembanding."
+            success_details = (
+                f"Path relatif: {payload_map.get('relative_path', '-')}{os.linesep}"
+                f"Folder pembanding target: {destination_root or '-'}{os.linesep}"
+                "Catatan: hasil scan dibersihkan. Silakan scan ulang untuk melihat kondisi terbaru."
+            )
+            self._record_history(
+                "Sinkronisasi folder pembanding",
+                "Sukses",
+                f"Berhasil: {processed_count} | Target: {destination_root or '-'} | Operasi: {operation_label}",
+                "success",
+            )
+            self._push_undo_action(undo_payload)
+            if active_transfer_dialog is not None:
+                active_transfer_dialog.show_success_state(success_summary, success_details)
+                active_transfer_dialog.flush_visual_state()
+            else:
+                self.show_success_dialog(
+                    "Sinkronisasi Folder Pembanding Berhasil",
+                    success_summary,
+                    success_details,
+                )
+            return
+
+        operation_label = "dipindahkan" if operation == "move" else "disalin"
+        title = "Pindah File Selesai" if operation == "move" else "Salin File Selesai"
+
+        if operation == "move" and processed_count > 0:
+            self.clear_results(reset_status=False)
+            self.status_label.setText(
+                "File berhasil dipindahkan. Hasil scan dibersihkan karena struktur sumber sudah berubah."
+            )
+        elif processed_count > 0:
+            self.status_label.setText(f"{processed_count} file berhasil {operation_label}.")
+
+        detail_lines = [
+            f"Jumlah file berhasil: {processed_count}",
+            f"Folder tujuan: {destination_root or '-'}",
+        ]
+        if operation == "move" and processed_count > 0:
+            detail_lines.append("Catatan: hasil scan dibersihkan. Silakan scan ulang untuk melihat kondisi terbaru.")
+
+        if errors:
+            self._record_history(
+                "Pindah file terpilih" if operation == "move" else "Salin file terpilih",
+                "Sebagian gagal" if processed_count > 0 else "Gagal",
+                f"Berhasil: {processed_count} | Gagal: {error_count} | Tujuan: {destination_root or '-'}",
+                "warning" if processed_count > 0 else "error",
+            )
+            self._push_undo_action(undo_payload)
+            error_preview = os.linesep.join(errors[:10])
+            self.show_error_dialog(
+                title,
+                f"{processed_count} file berhasil {operation_label}, {error_count} file gagal diproses.",
+                f"{os.linesep.join(detail_lines)}{os.linesep}{os.linesep}{error_preview}",
+            )
+            return
+
+        self._record_history(
+            "Pindah file terpilih" if operation == "move" else "Salin file terpilih",
+            "Sukses",
+            f"Jumlah file: {processed_count} | Tujuan: {destination_root or '-'}",
+            "success",
+        )
+        self._push_undo_action(undo_payload)
+        self.show_success_dialog(title, f"{processed_count} file berhasil {operation_label}.", os.linesep.join(detail_lines))
+
+    def _finalize_undo_results(self) -> None:
+        payload_map = self._pending_undo_result or {}
+        self._pending_undo_result = None
+
+        label = str(payload_map.get("label", "Aksi terakhir"))
+        detail = str(payload_map.get("detail", ""))
+        restored_count = int(payload_map.get("restored_count", 0))
+        error_count = int(payload_map.get("error_count", 0))
+        errors = [str(item) for item in payload_map.get("errors", [])]
+        action_dir = str(payload_map.get("action_dir", ""))
+
+        self.undo_thread = None
+        self._set_undo_processing_state(False)
+        if self.undo_processing_dialog is not None:
+            self.undo_processing_dialog.close()
+            self.undo_processing_dialog.deleteLater()
+            self.undo_processing_dialog = None
+        self._refresh_undo_button()
+
+        if errors:
+            self._record_history(
+                "Undo",
+                "Sebagian gagal" if restored_count > 0 else "Gagal",
+                f"{label} | Berhasil: {restored_count} | Gagal: {error_count}",
+                "warning" if restored_count > 0 else "error",
+            )
+            self.status_label.setText(f"Undo untuk '{label}' belum sepenuhnya berhasil.")
+            self.show_error_dialog(
+                "Undo Belum Selesai",
+                f"Undo untuk '{label}' berhasil memulihkan {restored_count} operasi dan gagal pada {error_count} operasi.",
+                f"{detail}{os.linesep}{os.linesep}{os.linesep.join(errors[:10])}",
+            )
+            return
+
+        self._cleanup_undo_action_dir(action_dir)
+        self._record_history("Undo", "Sukses", f"{label} | Operasi dipulihkan: {restored_count}", "success")
+        recycle_note = ""
+        if label == "Penghapusan file" and "Mode: Recycle Bin" in detail:
+            recycle_note = (
+                "Catatan: undo penghapusan mode Recycle Bin memulihkan file dari backup internal aplikasi. "
+                "Item asli di Recycle Bin Windows mungkin masih ada dan dapat dihapus manual bila sudah tidak diperlukan."
+            )
+        if label in {"Penghapusan file", "Sinkronisasi folder pembanding", "Pindah file terpilih"}:
+            self.clear_results(reset_status=False)
+            status_text = f"Undo berhasil untuk aksi: {label}. Hasil scan dibersihkan, silakan scan ulang untuk melihat kondisi terbaru."
+            if recycle_note:
+                status_text = f"{status_text} Item asli di Recycle Bin mungkin masih ada."
+            self.status_label.setText(status_text)
+        else:
+            self.status_label.setText(
+                f"Undo berhasil untuk aksi: {label}." + (" Item asli di Recycle Bin mungkin masih ada." if recycle_note else "")
+            )
+        success_details = f"{detail}{os.linesep}Operasi dipulihkan: {restored_count}"
+        if recycle_note:
+            success_details = f"{success_details}{os.linesep}{os.linesep}{recycle_note}"
+        self.show_success_dialog(
+            "Undo Berhasil",
+            f"Aksi '{label}' berhasil dibatalkan.",
+            success_details,
+        )
 
     def show_error_dialog(self, title: str, summary: str, details: str) -> None:
         self.status_label.setText(summary or "Terjadi kesalahan pada aplikasi.")
@@ -3541,6 +4447,199 @@ class FolderCompareDeleteApp(QMainWindow):
             dialog.exec()
         except Exception:
             QMessageBox.information(self, title or APP_TITLE, summary or "Aksi berhasil diproses.")
+
+    def _history_detail_text(self, detail: str) -> str:
+        normalized_lines = [line.strip() for line in str(detail).splitlines() if line.strip()]
+        if not normalized_lines:
+            return "-"
+        return " | ".join(normalized_lines)
+
+    def _record_history(self, action: str, status: str, detail: str, tone: str = "info") -> None:
+        entry = HistoryEntry(
+            timestamp=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            action=action,
+            status=status,
+            detail=self._history_detail_text(detail),
+            tone=tone,
+        )
+        self.history_entries.insert(0, entry)
+        if len(self.history_entries) > self.history_limit:
+            self.history_entries = self.history_entries[: self.history_limit]
+        self.history_model.set_rows(self.history_entries)
+        self._update_history_empty_state()
+        self._refresh_history_summary()
+
+    def _refresh_history_summary(self) -> None:
+        count = len(self.history_entries)
+        self.history_count_badge.setText(f"{count} aksi")
+        self.clear_history_button.setEnabled(count > 0)
+        self._refresh_undo_button()
+
+    def _update_history_empty_state(self) -> None:
+        if not hasattr(self, "history_stack"):
+            return
+        if self.history_entries:
+            self.history_stack.setCurrentWidget(self.history_table)
+        else:
+            self.history_stack.setCurrentWidget(self.history_empty_state)
+        self._refresh_history_summary()
+
+    def clear_history(self) -> None:
+        self.history_entries = []
+        self.history_model.set_rows([])
+        self._update_history_empty_state()
+        self.status_label.setText("Riwayat aksi dibersihkan.")
+
+    def _refresh_undo_button(self) -> None:
+        if not hasattr(self, "undo_button"):
+            return
+        has_undo = bool(self.undo_stack) and not (self.undo_thread and self.undo_thread.is_alive())
+        self.undo_button.setEnabled(has_undo)
+        if self.undo_stack:
+            last_action = self.undo_stack[-1]
+            self.undo_button.setToolTip(f"Batalkan aksi terakhir: {last_action.label}")
+        else:
+            self.undo_button.setToolTip("Belum ada aksi yang bisa di-undo.")
+
+    def _create_undo_action_dir(self, label: str) -> Path:
+        safe_label = "".join(char if char.isalnum() else "_" for char in label.lower()).strip("_") or "aksi"
+        action_dir = self.undo_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_label}_{uuid4().hex[:8]}"
+        action_dir.mkdir(parents=True, exist_ok=True)
+        return action_dir
+
+    def _cleanup_undo_action_dir(self, action_dir: str) -> None:
+        if not action_dir:
+            return
+        try:
+            shutil.rmtree(action_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _push_undo_action(self, payload: Optional[Dict[str, Any]]) -> None:
+        if not payload:
+            return
+
+        operations = payload.get("operations", [])
+        if not isinstance(operations, list) or not operations:
+            self._cleanup_undo_action_dir(str(payload.get("action_dir", "")))
+            return
+
+        action = UndoAction(
+            label=str(payload.get("label", "Aksi terakhir")),
+            detail=str(payload.get("detail", "")),
+            operations=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in operations
+                if isinstance(item, dict)
+            ],
+            action_dir=str(payload.get("action_dir", "")),
+        )
+        if not action.operations:
+            self._cleanup_undo_action_dir(action.action_dir)
+            return
+
+        self.undo_stack.append(action)
+        while len(self.undo_stack) > self.undo_limit:
+            discarded = self.undo_stack.pop(0)
+            self._cleanup_undo_action_dir(discarded.action_dir)
+        self._refresh_undo_button()
+
+    @staticmethod
+    def _serialize_undo_operation(kind: str, **kwargs: str) -> Dict[str, str]:
+        operation = {"kind": kind}
+        operation.update({key: str(value) for key, value in kwargs.items()})
+        return operation
+
+    def _backup_file_for_undo(self, source: Path, action_dir: Path, prefix: str) -> Path:
+        backup_dir = action_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"{prefix}_{uuid4().hex}{source.suffix}"
+        shutil.copy2(source, backup_path)
+        return backup_path
+
+    def undo_last_action(self) -> None:
+        if self.scan_thread and self.scan_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses scan selesai sebelum menjalankan undo.")
+            return
+        if self.delete_thread and self.delete_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses penghapusan selesai sebelum menjalankan undo.")
+            return
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses salin/pindah selesai sebelum menjalankan undo.")
+            return
+        if self.undo_thread and self.undo_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Undo aksi sebelumnya masih berjalan.")
+            return
+        if not self.undo_stack:
+            QMessageBox.information(self, APP_TITLE, "Belum ada aksi yang bisa di-undo.")
+            return
+
+        action = self.undo_stack.pop()
+        self._refresh_undo_button()
+        self.status_label.setText(f"Menjalankan undo untuk aksi: {action.label}...")
+        self._record_history("Undo", "Diproses", action.label, "info")
+        self._set_undo_processing_state(True)
+        self.undo_button.setEnabled(False)
+
+        dialog = ProcessingOverlayDialog(self, "Undo Sedang Diproses", f"Mengembalikan aksi: {action.label}")
+        self.undo_processing_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        self.undo_thread = threading.Thread(target=self._undo_worker, args=(action,), daemon=True)
+        self.undo_thread.start()
+
+    def _undo_worker(self, action: UndoAction) -> None:
+        restored_count = 0
+        errors: List[str] = []
+
+        for operation in action.operations:
+            kind = operation.get("kind", "")
+            try:
+                if kind == "delete_path":
+                    path = Path(operation["path"])
+                    if path.exists():
+                        path.unlink()
+                    restored_count += 1
+                elif kind == "move_path":
+                    source = Path(operation["source"])
+                    destination = Path(operation["destination"])
+                    if not source.exists():
+                        raise FileNotFoundError(f"Path sumber undo tidak ditemukan: {source}")
+                    if destination.exists():
+                        raise FileExistsError(f"Path tujuan undo sudah ada: {destination}")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), str(destination))
+                    restored_count += 1
+                elif kind == "restore_copy":
+                    backup = Path(operation["backup"])
+                    destination = Path(operation["destination"])
+                    if not backup.exists():
+                        raise FileNotFoundError(f"Backup undo tidak ditemukan: {backup}")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        destination.unlink()
+                    shutil.copy2(backup, destination)
+                    restored_count += 1
+                else:
+                    raise ValueError(f"Operasi undo tidak dikenal: {kind}")
+            except Exception as exc:
+                errors.append(f"{kind}: {exc}")
+
+        self.ui_queue.put(
+            (
+                "undo_done",
+                {
+                    "label": action.label,
+                    "detail": action.detail,
+                    "restored_count": restored_count,
+                    "error_count": len(errors),
+                    "errors": errors,
+                    "action_dir": action.action_dir,
+                },
+            )
+        )
 
     def _refresh_stats(self) -> None:
         total = len(self.result_rows)
@@ -3678,6 +4777,13 @@ class FolderCompareDeleteApp(QMainWindow):
             self._update_detail_from_row(current.row())
 
     def _on_table_focus_released(self) -> None:
+        QTimer.singleShot(0, self._handle_table_focus_release)
+
+    def _handle_table_focus_release(self) -> None:
+        focus_widget = QApplication.focusWidget()
+        if focus_widget is not None and hasattr(self, "detail_panel"):
+            if focus_widget is self.detail_panel or self.detail_panel.isAncestorOf(focus_widget):
+                return
         self.current_selected_result = None
         self._reset_detail_panel()
 
@@ -3706,15 +4812,17 @@ class FolderCompareDeleteApp(QMainWindow):
 
         self.current_selected_result = result
         self.detail_panel.setVisible(True)
+        actual_missing_labels = self._actual_missing_compare_labels(result)
         self.detail_labels["status"].setText(result.status_text)
         self.detail_labels["target"].setText(str(result.target_path))
         self.detail_labels["relative"].setText(result.target_relative_path)
         self.detail_labels["size"].setText(f"{self._format_size(result.size)} ({result.size} bytes)")
         self.detail_labels["found"].setText(result.exact_folder_labels)
-        self.detail_labels["missing"].setText(", ".join(result.missing_from_folders) if result.missing_from_folders else "-")
+        self.detail_labels["missing"].setText(", ".join(actual_missing_labels) if actual_missing_labels else "-")
         self.detail_labels["mode"].setText(result.match_type)
         self.detail_labels["exact"].setText(result.exact_paths_text)
         self.detail_labels["diff"].setText(result.diff_paths_text)
+        self._refresh_missing_compare_suggestion(result)
 
     def _reset_detail_panel(self) -> None:
         defaults = {
@@ -3732,6 +4840,8 @@ class FolderCompareDeleteApp(QMainWindow):
             self.detail_labels[key].setText(value)
         if hasattr(self, "detail_panel"):
             self.detail_panel.setVisible(False)
+        if hasattr(self, "missing_compare_suggestion"):
+            self.missing_compare_suggestion.setVisible(False)
 
     def copy_selected_path(self) -> None:
         if self.current_selected_result is None:
@@ -3740,14 +4850,495 @@ class FolderCompareDeleteApp(QMainWindow):
 
         QApplication.clipboard().setText(str(self.current_selected_result.target_path))
         self.status_label.setText("Path file target berhasil disalin ke clipboard.")
+        self._record_history("Salin path", "Sukses", str(self.current_selected_result.target_path), "info")
+
+    def _selected_results(self) -> List[MatchResult]:
+        selection_model = self.results_table.selectionModel()
+        if selection_model is None:
+            return []
+
+        selected_rows = sorted({index.row() for index in selection_model.selectedRows()})
+        results = [result for row_index in selected_rows if (result := self._result_for_table_row(row_index)) is not None]
+        if results:
+            return results
+        if self.current_selected_result is not None:
+            return [self.current_selected_result]
+        return []
+
+    def _sources_for_result(self, result: MatchResult) -> List[Tuple[str, str, Path]]:
+        sources: List[Tuple[str, str, Path]] = [("A", result.target_relative_path, result.target_path)]
+        for record in result.exact_matches:
+            sources.append((record.base_label, record.relative_path, record.path))
+        for record in result.same_name_different_content:
+            sources.append((record.base_label, record.relative_path, record.path))
+
+        deduplicated: List[Tuple[str, str, Path]] = []
+        seen_paths: set[str] = set()
+        for base_label, relative_path, path in sources:
+            normalized = os.path.normcase(str(path))
+            if normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+            deduplicated.append((base_label, relative_path, path))
+        return deduplicated
+
+    def _compare_folder_path_for_label(self, label: str) -> Optional[Path]:
+        if not label.startswith("F"):
+            return None
+        try:
+            index = int(label[1:]) - 1
+        except ValueError:
+            return None
+        if not (0 <= index < len(self.compare_folder_rows)):
+            return None
+        raw_path = self._normalize_folder_path(self.compare_folder_rows[index]["edit"].text())
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        return path if path.exists() and path.is_dir() else None
+
+    def _actual_missing_compare_labels(self, result: MatchResult) -> List[str]:
+        labels: List[str] = []
+        for missing_label in result.missing_from_folders:
+            compare_folder = self._compare_folder_path_for_label(missing_label)
+            if compare_folder is None:
+                continue
+            destination = compare_folder / result.target_relative_path
+            if not destination.exists():
+                labels.append(missing_label)
+        return labels
+
+    def _compare_sync_plan(self, result: MatchResult) -> Dict[str, Any]:
+        source = result.target_path if result.target_path.exists() and result.target_path.is_file() else None
+        if source is None:
+            return {"source": None, "create": [], "replace": [], "create_labels": [], "replace_labels": []}
+
+        create_paths: List[str] = []
+        create_labels: List[str] = []
+        for missing_label in self._actual_missing_compare_labels(result):
+            compare_folder = self._compare_folder_path_for_label(missing_label)
+            if compare_folder is None:
+                continue
+            create_paths.append(str(compare_folder / result.target_relative_path))
+            create_labels.append(missing_label)
+
+        replace_map: Dict[str, str] = {}
+        for record in result.same_name_different_content:
+            if not record.path:
+                continue
+            replace_map[record.base_label] = str(record.path)
+
+        return {
+            "source": str(source),
+            "create": create_paths,
+            "replace": list(replace_map.values()),
+            "create_labels": create_labels,
+            "replace_labels": list(replace_map.keys()),
+        }
+
+    def _refresh_missing_compare_suggestion(self, result: Optional[MatchResult]) -> None:
+        if not hasattr(self, "missing_compare_suggestion"):
+            return
+        if result is None:
+            self.missing_compare_suggestion.setVisible(False)
+            return
+
+        plan = self._compare_sync_plan(result)
+        create_labels = [label for label in plan["create_labels"] if label]
+        replace_labels = [label for label in plan["replace_labels"] if label]
+        if not plan["source"] or (not create_labels and not replace_labels):
+            self.missing_compare_suggestion.setVisible(False)
+            return
+
+        if create_labels and replace_labels:
+            suggestion_text = (
+                f"File ini bisa disalin atau dipindahkan ke folder pembanding. "
+                f"Tujuan baru: {', '.join(create_labels)}. "
+                f"Tujuan yang akan diganti: {', '.join(replace_labels)}."
+            )
+        elif replace_labels:
+            suggestion_text = (
+                "Versi file pada folder pembanding berbeda. "
+                f"Anda dapat menyalin atau memindahkan versi dari Folder A untuk menggantikan file di {', '.join(replace_labels)}."
+            )
+        else:
+            suggestion_text = (
+                "File ini belum ada di beberapa folder pembanding. "
+                f"Anda dapat menyalin atau memindahkannya ke {', '.join(create_labels)}."
+            )
+
+        self.missing_compare_suggestion_label.setText(suggestion_text)
+        self.missing_compare_suggestion.setVisible(True)
+
+    def copy_to_compare_folders(self) -> None:
+        self._sync_selected_result_to_compare_folders("copy")
+
+    def move_to_compare_folders(self) -> None:
+        self._sync_selected_result_to_compare_folders("move")
+
+    def _sync_selected_result_to_compare_folders(self, operation: str) -> None:
+        result = self.current_selected_result
+        if result is None:
+            QMessageBox.information(self, APP_TITLE, "Pilih satu item terlebih dahulu.")
+            return
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Proses salin/pindah file lain masih berjalan.")
+            return
+
+        plan = self._compare_sync_plan(result)
+        create_paths = [str(path) for path in plan["create"]]
+        replace_paths = [str(path) for path in plan["replace"]]
+        create_labels = [str(label) for label in plan["create_labels"]]
+        replace_labels = [str(label) for label in plan["replace_labels"]]
+        source = str(plan["source"] or "")
+
+        if not source or (not create_paths and not replace_paths):
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "Tidak ada folder pembanding yang relevan untuk aksi ini.",
+            )
+            self._refresh_missing_compare_suggestion(result)
+            return
+
+        operation_text = "dipindahkan" if operation == "move" else "disalin"
+        summary_lines = [f"File dari Folder A akan {operation_text} ke folder pembanding."]
+        if create_labels:
+            summary_lines.append(f"Tujuan baru: {', '.join(create_labels)}.")
+        if replace_labels:
+            summary_lines.append(f"Akan mengganti file yang sudah ada di: {', '.join(replace_labels)}.")
+        summary_lines.append("Struktur perbandingan akan berubah dan hasil scan perlu diperbarui.")
+
+        details_lines = [f"Sumber: {source}", f"Path relatif: {result.target_relative_path}"]
+        if create_labels:
+            details_lines.append(f"Folder pembanding yang akan ditambah: {', '.join(create_labels)}")
+        if replace_labels:
+            details_lines.append(f"Folder pembanding yang akan diganti: {', '.join(replace_labels)}")
+
+        confirm_dialog = ConfirmOverlayDialog(
+            self,
+            "Konfirmasi Sinkronisasi Folder Pembanding",
+            "\n".join(summary_lines),
+            "\n".join(details_lines),
+            detail_title="Rencana sinkronisasi",
+            confirm_button_text="Ya, Sinkronkan",
+            confirm_footnote="Periksa kembali folder pembanding tujuan sebelum melanjutkan sinkronisasi file.",
+            processing_footnote="Sinkronisasi file sedang berjalan. Mohon tunggu sampai proses selesai.",
+            processing_button_text="Menyinkronkan",
+            success_title="Sinkronisasi Folder Pembanding Berhasil",
+            success_detail_title="Ringkasan sinkronisasi",
+            success_footnote="Sinkronisasi selesai. Anda dapat menutup dialog ini.",
+        )
+        self.transfer_confirm_dialog = confirm_dialog
+        confirm_dialog.confirmRequested.connect(
+            lambda src=source, creates=list(create_paths), replaces=list(replace_paths), create_lbls=list(create_labels), replace_lbls=list(replace_labels), rel=result.target_relative_path, op=operation: self._start_compare_sync_from_dialog(
+                src, creates, replaces, create_lbls, replace_lbls, rel, op
+            )
+        )
+
+        dialog_result = confirm_dialog.exec()
+        if self.transfer_confirm_dialog is confirm_dialog:
+            self.transfer_confirm_dialog = None
+        confirm_dialog.deleteLater()
+
+        if dialog_result != QDialog.Accepted:
+            return
+
+    def _start_compare_sync_from_dialog(
+        self,
+        source: str,
+        create_paths: List[str],
+        replace_paths: List[str],
+        create_labels: List[str],
+        replace_labels: List[str],
+        relative_path: str,
+        operation: str,
+    ) -> None:
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            return
+
+        dialog = self.transfer_confirm_dialog
+        if dialog is None:
+            return
+
+        operation_text = "pemindahan" if operation == "move" else "penyalinan"
+        self.status_label.setText(
+            "Memindahkan file ke folder pembanding..." if operation == "move" else "Menyalin file ke folder pembanding..."
+        )
+        dialog.set_processing(
+            True,
+            f"Sedang memproses {operation_text} file ke folder pembanding. Mohon tunggu...",
+        )
+        self._set_transfer_processing_state(True)
+        dialog.flush_visual_state()
+        self._record_history(
+            "Sinkronisasi folder pembanding",
+            "Diproses",
+            (
+                f"Operasi: {'pindah' if operation == 'move' else 'salin'}\n"
+                f"Sumber: {source}\n"
+                f"Tambah ke: {', '.join(create_labels) if create_labels else '-'}\n"
+                f"Ganti di: {', '.join(replace_labels) if replace_labels else '-'}"
+            ),
+            "info",
+        )
+
+        QTimer.singleShot(
+            0,
+            lambda src=source, creates=list(create_paths), replaces=list(replace_paths), create_lbls=list(create_labels), replace_lbls=list(replace_labels), rel=relative_path, op=operation: self._launch_compare_sync_worker(
+                src, creates, replaces, create_lbls, replace_lbls, rel, op
+            ),
+        )
+
+    def _launch_compare_sync_worker(
+        self,
+        source: str,
+        create_paths: List[str],
+        replace_paths: List[str],
+        create_labels: List[str],
+        replace_labels: List[str],
+        relative_path: str,
+        operation: str,
+    ) -> None:
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            return
+        self.transfer_thread = threading.Thread(
+            target=self._compare_sync_worker,
+            args=(source, create_paths, replace_paths, create_labels, replace_labels, relative_path, operation),
+            daemon=True,
+        )
+        self.transfer_thread.start()
+
+    def _compare_sync_worker(
+        self,
+        source_path: str,
+        create_paths: List[str],
+        replace_paths: List[str],
+        create_labels: List[str],
+        replace_labels: List[str],
+        relative_path: str,
+        operation: str,
+    ) -> None:
+        processed_count = 0
+        errors: List[str] = []
+        source = Path(source_path)
+        all_targets = [(path, False) for path in create_paths] + [(path, True) for path in replace_paths]
+        undo_operations: List[Dict[str, str]] = []
+        action_dir = self._create_undo_action_dir("compare_sync")
+        source_backup_path: Optional[Path] = None
+
+        for destination_path, should_replace in all_targets:
+            destination = Path(destination_path)
+            try:
+                if not source.exists() or not source.is_file():
+                    raise FileNotFoundError(f"File sumber tidak ditemukan: {source}")
+
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if should_replace and destination.exists():
+                    backup_path = self._backup_file_for_undo(destination, action_dir, "replace")
+                    destination.unlink()
+                    undo_operations.append(
+                        self._serialize_undo_operation(
+                            "restore_copy",
+                            backup=str(backup_path),
+                            destination=str(destination),
+                        )
+                    )
+                elif not should_replace and destination.exists():
+                    raise FileExistsError(f"File tujuan sudah ada: {destination}")
+
+                shutil.copy2(source, destination)
+                undo_operations.insert(0, self._serialize_undo_operation("delete_path", path=str(destination)))
+                processed_count += 1
+            except Exception as exc:
+                errors.append(f"{destination}: {exc}")
+
+        if operation == "move" and processed_count == len(all_targets) and source.exists():
+            try:
+                source_backup_path = self._backup_file_for_undo(source, action_dir, "source")
+                source.unlink()
+                undo_operations.append(
+                    self._serialize_undo_operation(
+                        "restore_copy",
+                        backup=str(source_backup_path),
+                        destination=str(source),
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+
+        undo_payload = {
+            "label": "Sinkronisasi folder pembanding",
+            "detail": f"Path relatif: {relative_path}\nTarget: {', '.join(create_labels + replace_labels)}",
+            "operations": undo_operations,
+            "action_dir": str(action_dir),
+        } if undo_operations else None
+        if undo_payload is None:
+            self._cleanup_undo_action_dir(str(action_dir))
+
+        self.ui_queue.put(
+            (
+                "transfer_done",
+                {
+                    "operation": "move_compare_sync" if operation == "move" else "copy_compare_sync",
+                    "processed_count": processed_count,
+                    "error_count": len(errors),
+                    "destination_root": ", ".join(create_labels + replace_labels),
+                    "relative_path": relative_path,
+                    "created_labels": create_labels,
+                    "replaced_labels": replace_labels,
+                    "errors": errors,
+                    "undo_action": undo_payload,
+                },
+            )
+        )
+
+    @staticmethod
+    def _unique_destination_path(destination: Path) -> Path:
+        if not destination.exists():
+            return destination
+
+        counter = 2
+        while True:
+            candidate = destination.with_name(f"{destination.stem} ({counter}){destination.suffix}")
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def transfer_selected_files(self, operation: str) -> None:
+        if self.scan_thread and self.scan_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses scan selesai sebelum menyalin atau memindahkan file.")
+            return
+        if self.delete_thread and self.delete_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses penghapusan selesai terlebih dahulu.")
+            return
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Proses salin/pindah file masih berjalan.")
+            return
+
+        selected_results = self._selected_results()
+        if not selected_results:
+            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu item hasil scan untuk disalin atau dipindahkan.")
+            return
+
+        source_entries: List[Tuple[str, str, str]] = []
+        seen_paths: set[str] = set()
+        for result in selected_results:
+            for base_label, relative_path, path in self._sources_for_result(result):
+                normalized = os.path.normcase(str(path))
+                if normalized in seen_paths:
+                    continue
+                seen_paths.add(normalized)
+                source_entries.append((base_label, relative_path, str(path)))
+
+        if not source_entries:
+            QMessageBox.information(self, APP_TITLE, "Tidak ada file sumber yang dapat diproses dari pilihan saat ini.")
+            return
+
+        destination_root = QFileDialog.getExistingDirectory(
+            self,
+            "Pilih folder tujuan untuk menyalin file" if operation == "copy" else "Pilih folder tujuan untuk memindahkan file",
+            str(Path.home()),
+        )
+        if not destination_root:
+            return
+
+        operation_title = "Pindah File" if operation == "move" else "Salin File"
+        operation_label = "dipindahkan" if operation == "move" else "disalin"
+        if QMessageBox.question(
+            self,
+            operation_title,
+            (
+                f"{len(source_entries)} file terkait akan {operation_label} ke folder tujuan terpilih.\n"
+                "Struktur sumber akan dipertahankan berdasarkan label folder (A, F1, F2, dst). Lanjutkan?"
+            ),
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        self.status_label.setText(
+            "Memproses pemindahan file terkait..." if operation == "move" else "Memproses penyalinan file terkait..."
+        )
+        self._set_transfer_processing_state(True)
+        self._record_history(
+            "Pindah file terpilih" if operation == "move" else "Salin file terpilih",
+            "Diproses",
+            f"Jumlah file sumber: {len(source_entries)}\nFolder tujuan: {destination_root}",
+            "info",
+        )
+        self.transfer_thread = threading.Thread(
+            target=self._transfer_worker,
+            args=(list(source_entries), destination_root, operation),
+            daemon=True,
+        )
+        self.transfer_thread.start()
+
+    def _transfer_worker(self, source_entries: List[Tuple[str, str, str]], destination_root: str, operation: str) -> None:
+        processed_count = 0
+        errors: List[str] = []
+        destination_root_path = Path(destination_root)
+        undo_operations: List[Dict[str, str]] = []
+
+        for base_label, relative_path, source_path in source_entries:
+            source = Path(source_path)
+            try:
+                if not source.exists() or not source.is_file():
+                    raise FileNotFoundError(f"File tidak ditemukan: {source}")
+
+                target = self._unique_destination_path(destination_root_path / base_label / Path(relative_path))
+                target.parent.mkdir(parents=True, exist_ok=True)
+
+                if operation == "move":
+                    shutil.move(str(source), str(target))
+                    undo_operations.append(
+                        self._serialize_undo_operation(
+                            "move_path",
+                            source=str(target),
+                            destination=str(source),
+                        )
+                    )
+                else:
+                    shutil.copy2(source, target)
+                    undo_operations.append(
+                        self._serialize_undo_operation("delete_path", path=str(target))
+                    )
+                processed_count += 1
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+
+        undo_payload = {
+            "label": "Pindah file terpilih" if operation == "move" else "Salin file terpilih",
+            "detail": f"Folder tujuan: {destination_root}",
+            "operations": undo_operations,
+        } if undo_operations else None
+
+        self.ui_queue.put(
+            (
+                "transfer_done",
+                {
+                    "operation": operation,
+                    "processed_count": processed_count,
+                    "error_count": len(errors),
+                    "destination_root": destination_root,
+                    "errors": errors,
+                    "undo_action": undo_payload,
+                },
+            )
+        )
 
     def clear_results(self, reset_status: bool = True) -> None:
+        had_results = bool(self.result_rows)
         if self.delete_confirm_dialog is not None:
             self.delete_confirm_dialog.force_close(QDialog.Rejected)
             self.delete_confirm_dialog = None
+        if self.transfer_confirm_dialog is not None:
+            self.transfer_confirm_dialog.force_close(QDialog.Rejected)
+            self.transfer_confirm_dialog = None
         if self.delete_processing_dialog is not None:
             self.delete_processing_dialog.close()
             self.delete_processing_dialog = None
+        if self.undo_processing_dialog is not None:
+            self.undo_processing_dialog.close()
+            self.undo_processing_dialog = None
         self.result_rows = []
         self._pending_scan_results = None
         self._awaiting_scan_finalize = False
@@ -3761,6 +5352,8 @@ class FolderCompareDeleteApp(QMainWindow):
         self.export_excel_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.delete_all_button.setEnabled(False)
+        self.copy_button.setEnabled(False)
+        self.move_button.setEnabled(False)
 
         for label in self.stat_labels.values():
             label.setText("0")
@@ -3778,6 +5371,13 @@ class FolderCompareDeleteApp(QMainWindow):
 
         if reset_status:
             self.status_label.setText("Hasil dibersihkan. Silakan pilih folder baru.")
+            if had_results:
+                self._record_history(
+                    "Reset hasil",
+                    "Sukses",
+                    "Hasil scan dibersihkan dari tampilan aplikasi.",
+                    "info",
+                )
 
     def delete_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self.results_table.selectionModel().selectedRows()})
@@ -3785,48 +5385,71 @@ class FolderCompareDeleteApp(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari hasil scan.")
             return
 
-        deletable: List[Path] = []
-        skipped = 0
+        deletable_results: List[MatchResult] = []
+        skipped_counts = {"different_content": 0, "only_target": 0}
         for row_index in selected_rows:
             result = self._result_for_table_row(row_index)
             if result is None:
                 continue
-            if result.exact_matches:
-                deletable.append(result.target_path)
+            if self._is_result_deletable(result):
+                deletable_results.append(result)
             else:
-                skipped += 1
+                skipped_counts[result.tree_tag] = skipped_counts.get(result.tree_tag, 0) + 1
 
-        if not deletable:
-            QMessageBox.information(self, APP_TITLE, "Pilihan Anda tidak mengandung file hijau yang aman dihapus.")
-            return
-        if skipped:
+        if not deletable_results:
             QMessageBox.information(
                 self,
                 APP_TITLE,
-                f"{skipped} item merah/oranye diabaikan karena tidak aman dihapus otomatis.",
+                "Pilihan Anda belum termasuk kategori yang diizinkan untuk dihapus. Aktifkan opsi merah/oranye jika memang diperlukan.",
             )
+            return
+        skipped_messages: List[str] = []
+        if skipped_counts.get("different_content", 0):
+            skipped_messages.append(
+                f"{skipped_counts['different_content']} item merah diabaikan karena izin hapus merah belum aktif."
+            )
+        if skipped_counts.get("only_target", 0):
+            skipped_messages.append(
+                f"{skipped_counts['only_target']} item oranye diabaikan karena izin hapus oranye belum aktif."
+            )
+        if skipped_messages:
+            QMessageBox.information(self, APP_TITLE, " ".join(skipped_messages))
 
-        self._confirm_and_delete(deletable)
+        self._confirm_and_delete(deletable_results)
 
     def delete_all_results(self) -> None:
-        paths = [row.target_path for row in self.result_rows if row.exact_matches]
-        if not paths:
-            QMessageBox.information(self, APP_TITLE, "Belum ada hasil hijau untuk dihapus.")
+        deletable_results = self._deletable_results()
+        if not deletable_results:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "Belum ada hasil yang sesuai dengan izin hapus saat ini.",
+            )
             return
-        self._confirm_and_delete(paths)
+        self._confirm_and_delete(deletable_results)
 
-    def _confirm_and_delete(self, paths: List[Path]) -> None:
+    def _confirm_and_delete(self, results: List[MatchResult]) -> None:
         if self.delete_thread and self.delete_thread.is_alive():
             QMessageBox.information(self, APP_TITLE, "Proses penghapusan masih berjalan.")
             return
 
-        preview = "\n".join(str(path) for path in paths[:10])
-        extra = "" if len(paths) <= 10 else f"\n... dan {len(paths) - 10} file lainnya"
+        delete_paths = [result.target_path for result in results]
+        scope_counts = self._delete_scope_counts(results)
+        preview = "\n".join(f"[{result.status_text}] {result.target_path}" for result in results[:10])
+        extra = "" if len(delete_paths) <= 10 else f"\n... dan {len(delete_paths) - 10} file lainnya"
         mode_text = "Recycle Bin" if self._current_delete_mode() == "recycle_bin" else "hapus permanen"
-        summary = (
-            f"Anda akan memproses {len(paths)} file hijau dari Folder A.\n"
-            f"Mode penghapusan: {mode_text}."
-        )
+        summary_lines = [
+            f"Anda akan memproses {len(delete_paths)} file dari Folder A.",
+            (
+                f"Kategori: hijau {scope_counts['exact_match']} | "
+                f"merah {scope_counts['different_content']} | "
+                f"oranye {scope_counts['only_target']}."
+            ),
+            f"Mode penghapusan: {mode_text}.",
+        ]
+        if scope_counts["different_content"] or scope_counts["only_target"]:
+            summary_lines.append("Perhatian: pilihan ini mencakup hasil merah/oranye yang berisiko lebih tinggi.")
+        summary = "\n".join(summary_lines)
         details = f"{preview}{extra}"
 
         confirm_dialog = ConfirmOverlayDialog(
@@ -3837,7 +5460,7 @@ class FolderCompareDeleteApp(QMainWindow):
         )
         self.delete_confirm_dialog = confirm_dialog
         confirm_dialog.confirmRequested.connect(
-            lambda delete_paths=list(paths): self._start_delete_from_confirm_dialog(delete_paths)
+            lambda selected_paths=list(delete_paths): self._start_delete_from_confirm_dialog(selected_paths)
         )
 
         result = confirm_dialog.exec()
@@ -3860,6 +5483,12 @@ class FolderCompareDeleteApp(QMainWindow):
         dialog.set_processing(True, f"Sedang memproses {len(paths)} file dari Folder A. Mohon tunggu...")
         self._set_delete_processing_state(True)
         dialog.flush_visual_state()
+        self._record_history(
+            "Penghapusan file",
+            "Diproses",
+            f"Jumlah file: {len(paths)}\nMode: {'Recycle Bin' if self._current_delete_mode() == 'recycle_bin' else 'Permanen'}",
+            "warning",
+        )
 
         use_recycle_bin = self._current_delete_mode() == "recycle_bin"
         QTimer.singleShot(
@@ -3884,17 +5513,43 @@ class FolderCompareDeleteApp(QMainWindow):
         deleted_count = 0
         deleted_paths: List[Path] = []
         errors: List[str] = []
+        undo_payload: Optional[Dict[str, Any]] = None
+        action_dir = self._create_undo_action_dir("delete")
+        undo_operations: List[Dict[str, str]] = []
 
         for path in paths:
             try:
+                if not path.exists() or not path.is_file():
+                    raise FileNotFoundError(f"File tidak ditemukan: {path}")
+                backup_path = self._backup_file_for_undo(path, action_dir, "delete")
                 if use_recycle_bin:
                     self._send_to_recycle_bin(path)
                 else:
                     path.unlink()
                 deleted_count += 1
                 deleted_paths.append(path)
+                undo_operations.append(
+                    self._serialize_undo_operation(
+                        "restore_copy",
+                        backup=str(backup_path),
+                        destination=str(path),
+                    )
+                )
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
+
+        if undo_operations:
+            undo_payload = {
+                "label": "Penghapusan file",
+                "detail": (
+                    f"Jumlah file: {deleted_count}\n"
+                    f"Mode: {'Recycle Bin' if use_recycle_bin else 'Permanen'}"
+                ),
+                "operations": undo_operations,
+                "action_dir": str(action_dir),
+            }
+        else:
+            self._cleanup_undo_action_dir(str(action_dir))
 
         self.ui_queue.put(
             (
@@ -3903,6 +5558,7 @@ class FolderCompareDeleteApp(QMainWindow):
                     "deleted_count": deleted_count,
                     "deleted_paths": [str(path) for path in deleted_paths],
                     "errors": errors,
+                    "undo_action": undo_payload,
                 },
             )
         )
@@ -3920,6 +5576,30 @@ class FolderCompareDeleteApp(QMainWindow):
         )
         if not save_path:
             return
+
+        undo_payload: Optional[Dict[str, Any]]
+        existing_csv = Path(save_path)
+        if existing_csv.exists() and existing_csv.is_file():
+            action_dir = self._create_undo_action_dir("export_csv")
+            backup_path = self._backup_file_for_undo(existing_csv, action_dir, "export_csv")
+            undo_payload = {
+                "label": "Export CSV",
+                "detail": save_path,
+                "operations": [
+                    self._serialize_undo_operation(
+                        "restore_copy",
+                        backup=str(backup_path),
+                        destination=save_path,
+                    )
+                ],
+                "action_dir": str(action_dir),
+            }
+        else:
+            undo_payload = {
+                "label": "Export CSV",
+                "detail": save_path,
+                "operations": [self._serialize_undo_operation("delete_path", path=save_path)],
+            }
 
         with open(save_path, "w", newline="", encoding="utf-8-sig") as csvfile:
             writer = csv.writer(csvfile)
@@ -3953,6 +5633,8 @@ class FolderCompareDeleteApp(QMainWindow):
                     ]
                 )
 
+        self._push_undo_action(undo_payload)
+        self._record_history("Export CSV", "Sukses", save_path, "success")
         QMessageBox.information(self, APP_TITLE, f"Berhasil menyimpan CSV:\n{save_path}")
 
     def export_excel(self) -> None:
@@ -3971,6 +5653,30 @@ class FolderCompareDeleteApp(QMainWindow):
         )
         if not save_path:
             return
+
+        undo_payload: Optional[Dict[str, Any]]
+        existing_excel = Path(save_path)
+        if existing_excel.exists() and existing_excel.is_file():
+            action_dir = self._create_undo_action_dir("export_excel")
+            backup_path = self._backup_file_for_undo(existing_excel, action_dir, "export_excel")
+            undo_payload = {
+                "label": "Export Excel",
+                "detail": save_path,
+                "operations": [
+                    self._serialize_undo_operation(
+                        "restore_copy",
+                        backup=str(backup_path),
+                        destination=save_path,
+                    )
+                ],
+                "action_dir": str(action_dir),
+            }
+        else:
+            undo_payload = {
+                "label": "Export Excel",
+                "detail": save_path,
+                "operations": [self._serialize_undo_operation("delete_path", path=save_path)],
+            }
 
         from openpyxl import Workbook
         from openpyxl.styles import PatternFill
@@ -4020,6 +5726,8 @@ class FolderCompareDeleteApp(QMainWindow):
             worksheet.column_dimensions[column_letter].width = width
 
         workbook.save(save_path)
+        self._push_undo_action(undo_payload)
+        self._record_history("Export Excel", "Sukses", save_path, "success")
         QMessageBox.information(self, APP_TITLE, f"Berhasil menyimpan Excel:\n{save_path}")
 
     def _send_to_recycle_bin(self, path: Path) -> None:
