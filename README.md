@@ -21,19 +21,19 @@ Antarmuka utama untuk menganalisis dan membandingkan _Folder A_ (Target) dengan 
 - 🔴 **Merah (Berbeda)**: Nama sama namun isi (hash/ukuran) berbeda.
 - 🟠 **Oranye (Hanya di A)**: File eksklusif yang hanya ada di Folder A.
 
-![Main UI](assets/main_ui.png)
+![Main UI](https://github.com/user-attachments/assets/562575c3-bd77-4ba6-a825-76f9d12f2bde)
 
 ### 2. Riwayat Aksi (Action History)
 
 Mencatat dan memantau setiap rekam jejak operasi file di dalam aplikasi (seperti Scan, Hapus, Pindah, atau Restore). Pengguna dapat melihat detail eksekusi proses dan membatalkan aksi (Undo).
 
-![History UI](assets/history_ui.png)
+![History UI](https://github.com/user-attachments/assets/e3406637-e978-4905-90c2-8c0921790051)
 
 ### 3. Trash Internal Aplikasi (Safe Delete)
 
 Menyediakan lapisan keamanan cadangan. File yang terhapus dapat disimpan di Trash Internal, sehingga Anda dapat memulihkannya kapan saja dan menghindar dari risiko hilangnya data secara permanen akibat kesalahan klik.
 
-![Trash UI](assets/trash_ui.png)
+![Trash UI](https://github.com/user-attachments/assets/9627fcee-0674-4a8f-b34b-4a67d25390a0).
 
 ---
 
