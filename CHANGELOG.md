@@ -2,6 +2,17 @@
 
 Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
+## [2.2.0] - 2026-04-04
+
+### Ditambahkan
+- Sistem **Trash Internal** khusus aplikasi. File yang dihapus bisa disimpan dalam direktori aman internal untuk menghindari penggunaan Recycle Bin Windows secara langsung.
+- Dialog interaktif `FileDetailOverlayDialog` saat Anda melakukan *double klik* pada file di tabel. Tampilan detail baru memuat informasi path, status sinkronisasi, ukuran dan opsi tindakan sinkronisasi (`copy` atau `move` ke folder pembanding).
+- Penyempurnaan UX *undo* dan pengelolaan navigasi menu secara persisten di aplikasi berbasis *State* (`trash_db.json`).
+- Tab menu baru khusus pengaturan dan pemantauan berkas yang berada dalam keranjang sampah (Trash) internal dengan total perhitungan kapasitas secara *real time*.
+
+### Diperbarui
+- Refaktor mode Recycle bin menjadi *Trash Internal* yang lebih dapat disesuaikan dan di-undo tanpa campur tangan dari OS layer.
+
 ## [2.1.0] - 2026-04-04
 
 ### Ditambahkan

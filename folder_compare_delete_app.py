@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,8 @@ try:
         QStackedLayout,
         QStackedWidget,
         QTableView,
+        QTableWidget,
+        QTableWidgetItem,
         QVBoxLayout,
         QWidget,
     )
@@ -51,7 +54,7 @@ except ImportError as exc:
 
 
 APP_TITLE = "Folder Compare & Delete"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 APP_DEVELOPER = "Tonzdev"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 BG_COLOR = "#f4f7fb"
@@ -141,6 +144,15 @@ class UndoAction:
     detail: str
     operations: List[Dict[str, str]] = field(default_factory=list)
     action_dir: str = ""
+
+
+@dataclass
+class TrashEntry:
+    entry_id: str
+    original_path: str
+    trash_path: str
+    deleted_at: str
+    size: int
 
 
 class ResponsiveTableWidget(QTableView):
@@ -1545,6 +1557,489 @@ class SuccessOverlayDialog(QDialog):
             self._is_finalizing = False
 
 
+class FileDetailOverlayDialog(QDialog):
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        result: MatchResult,
+        missing_labels: List[str],
+        suggestion_text: str,
+        *,
+        show_compare_actions: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._blur_target = parent.centralWidget() if isinstance(parent, QMainWindow) else parent
+        self._owns_blur_effect = False
+        self._is_finalizing = False
+        self._close_result = QDialog.Accepted
+        self._open_animation_started = False
+        self._blur_effect: Optional[QGraphicsBlurEffect] = None
+        self._result = result
+        self._show_compare_actions = show_compare_actions
+
+        self.setModal(True)
+        self.setObjectName("FileDetailOverlayDialog")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMinimumSize(860, 620)
+        self.setWindowOpacity(0.0)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        overlay = QFrame()
+        self.overlay = overlay
+        overlay.setObjectName("FileDetailOverlayBackdrop")
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.addStretch(1)
+
+        card = QFrame()
+        self.card = card
+        card.setObjectName("FileDetailOverlayCard")
+        card.setMinimumWidth(760)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(16)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(14)
+
+        icon_badge = QLabel("i")
+        icon_badge.setObjectName("FileDetailOverlayIcon")
+        icon_badge.setAlignment(Qt.AlignCenter)
+        icon_badge.setFixedSize(52, 52)
+
+        title_wrap = QVBoxLayout()
+        title_wrap.setSpacing(4)
+
+        title_label = QLabel("Detail File Terpilih")
+        title_label.setObjectName("FileDetailOverlayTitle")
+        title_label.setWordWrap(True)
+
+        summary_label = QLabel(f"{result.status_text} | {result.target_relative_path}")
+        summary_label.setObjectName("FileDetailOverlaySummary")
+        summary_label.setWordWrap(True)
+        summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        title_wrap.addWidget(title_label)
+        title_wrap.addWidget(summary_label)
+        header_row.addWidget(icon_badge, 0, Qt.AlignTop)
+        header_row.addLayout(title_wrap, 1)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("FileDetailOverlayScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        body = QWidget()
+        body.setObjectName("FileDetailOverlayBody")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(14)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        info_cards = [
+            ("Status", result.status_text),
+            ("Path Target", str(result.target_path)),
+            ("Relative Path", result.target_relative_path),
+            ("Ukuran", f"{MatchResultTableModel._format_size(result.size)} ({result.size} bytes)"),
+            ("Ditemukan di", result.exact_folder_labels),
+            ("Tidak Ada di", ", ".join(missing_labels) if missing_labels else "-"),
+            ("Mode", result.match_type),
+        ]
+
+        for index, (label_text, value_text) in enumerate(info_cards):
+            grid.addWidget(self._create_info_card(label_text, value_text), index // 2, index % 2)
+
+        body_layout.addLayout(grid)
+
+        exact_card = self._create_text_card("Path Cocok", result.exact_paths_text)
+        diff_card = self._create_text_card("Path Beda", result.diff_paths_text)
+        body_layout.addWidget(exact_card)
+        body_layout.addWidget(diff_card)
+
+        if suggestion_text:
+            suggestion_card = QFrame()
+            suggestion_card.setObjectName("FileDetailSuggestionCard")
+            suggestion_layout = QVBoxLayout(suggestion_card)
+            suggestion_layout.setContentsMargins(14, 12, 14, 12)
+            suggestion_layout.setSpacing(10)
+
+            suggestion_title = QLabel("Saran Tindakan")
+            suggestion_title.setObjectName("FileDetailSuggestionTitle")
+
+            suggestion_label = QLabel(suggestion_text)
+            suggestion_label.setObjectName("FileDetailSuggestionText")
+            suggestion_label.setWordWrap(True)
+
+            suggestion_layout.addWidget(suggestion_title)
+            suggestion_layout.addWidget(suggestion_label)
+
+            if show_compare_actions:
+                suggestion_actions = QHBoxLayout()
+                suggestion_actions.setSpacing(10)
+                suggestion_actions.addStretch(1)
+
+                copy_compare_button = QPushButton("Salin ke Folder Pembanding")
+                copy_compare_button.setObjectName("FileDetailSecondaryButton")
+                copy_compare_button.clicked.connect(lambda: self._trigger_compare_action("copy"))
+
+                move_compare_button = QPushButton("Pindah ke Folder Pembanding")
+                move_compare_button.setObjectName("FileDetailGhostButton")
+                move_compare_button.clicked.connect(lambda: self._trigger_compare_action("move"))
+
+                suggestion_actions.addWidget(copy_compare_button)
+                suggestion_actions.addWidget(move_compare_button)
+                suggestion_layout.addLayout(suggestion_actions)
+
+            body_layout.addWidget(suggestion_card)
+
+        scroll.setWidget(body)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch(1)
+
+        copy_button = QPushButton("Copy Path")
+        copy_button.setObjectName("FileDetailSecondaryButton")
+        copy_button.clicked.connect(self._copy_selected_path)
+
+        close_button = QPushButton("Tutup")
+        close_button.setObjectName("FileDetailPrimaryButton")
+        close_button.clicked.connect(lambda: self.done(QDialog.Accepted))
+        close_button.setAutoDefault(True)
+        close_button.setDefault(True)
+
+        button_row.addWidget(copy_button)
+        button_row.addWidget(close_button)
+
+        card_layout.addLayout(header_row)
+        card_layout.addWidget(scroll, 1)
+        card_layout.addLayout(button_row)
+
+        overlay_layout.addWidget(card, 0, Qt.AlignCenter)
+        overlay_layout.addStretch(1)
+        outer.addWidget(overlay)
+
+        self.setStyleSheet(
+            f"""
+            QDialog#FileDetailOverlayDialog {{
+                background: transparent;
+            }}
+            QFrame#FileDetailOverlayBackdrop {{
+                background: rgba(11, 18, 32, 168);
+                border-radius: 0px;
+            }}
+            QFrame#FileDetailOverlayCard {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #ffffff,
+                    stop: 1 #f5f9ff
+                );
+                border: 1px solid #d6e0f4;
+                border-radius: 24px;
+            }}
+            QLabel#FileDetailOverlayIcon {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #2c67f2,
+                    stop: 1 #5a8dff
+                );
+                color: white;
+                border-radius: 26px;
+                font: 700 18pt "Segoe UI";
+            }}
+            QLabel#FileDetailOverlayTitle {{
+                color: {TEXT};
+                font: 700 15pt "Segoe UI";
+            }}
+            QLabel#FileDetailOverlaySummary {{
+                color: {MUTED};
+                font: 10pt "Segoe UI";
+            }}
+            QScrollArea#FileDetailOverlayScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QWidget#FileDetailOverlayBody {{
+                background: transparent;
+            }}
+            QFrame#FileDetailInfoCard {{
+                background: #f8fbff;
+                border: 1px solid #dbe5f7;
+                border-radius: 16px;
+            }}
+            QLabel#FileDetailInfoTitle {{
+                color: {MUTED};
+                font: 700 9pt "Segoe UI";
+            }}
+            QLabel#FileDetailInfoValue {{
+                color: {TEXT};
+                font: 9.5pt "Segoe UI";
+            }}
+            QFrame#FileDetailTextCard {{
+                background: #f8fbff;
+                border: 1px solid #dbe5f7;
+                border-radius: 16px;
+            }}
+            QLabel#FileDetailTextTitle {{
+                color: {TEXT};
+                font: 700 10pt "Segoe UI";
+            }}
+            QPlainTextEdit#FileDetailTextBox {{
+                background: #fcfdff;
+                color: #25324a;
+                border: 1px solid #dbe5f7;
+                border-radius: 12px;
+                padding: 10px;
+                font: 9.3pt "Consolas";
+                selection-background-color: #cfe0ff;
+            }}
+            QFrame#FileDetailSuggestionCard {{
+                background: #f2f8ff;
+                border: 1px solid #d2e1f7;
+                border-radius: 16px;
+            }}
+            QLabel#FileDetailSuggestionTitle {{
+                color: {TEXT};
+                font: 700 10pt "Segoe UI";
+            }}
+            QLabel#FileDetailSuggestionText {{
+                color: #35527a;
+                font: 9.5pt "Segoe UI";
+            }}
+            QPushButton#FileDetailPrimaryButton {{
+                min-width: 120px;
+                padding: 10px 18px;
+                border: none;
+                border-radius: 14px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 {PRIMARY},
+                    stop: 1 #4d84ff
+                );
+                color: white;
+                font: 700 10pt "Segoe UI";
+            }}
+            QPushButton#FileDetailPrimaryButton:hover {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 {PRIMARY_DARK},
+                    stop: 1 #386cf0
+                );
+            }}
+            QPushButton#FileDetailSecondaryButton {{
+                min-width: 120px;
+                padding: 10px 18px;
+                border-radius: 14px;
+                border: 1px solid #d3def2;
+                background: white;
+                color: {TEXT};
+                font: 600 10pt "Segoe UI";
+            }}
+            QPushButton#FileDetailSecondaryButton:hover {{
+                background: #f4f8ff;
+            }}
+            QPushButton#FileDetailGhostButton {{
+                min-width: 120px;
+                padding: 10px 18px;
+                border: none;
+                border-radius: 14px;
+                background: #edf3ff;
+                color: {TEXT};
+                font: 600 10pt "Segoe UI";
+            }}
+            QPushButton#FileDetailGhostButton:hover {{
+                background: #e2ecff;
+            }}
+            """
+        )
+
+    def _create_info_card(self, title: str, value: str) -> QWidget:
+        card = QFrame()
+        card.setObjectName("FileDetailInfoCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("FileDetailInfoTitle")
+
+        value_label = QLabel(value or "-")
+        value_label.setObjectName("FileDetailInfoValue")
+        value_label.setWordWrap(True)
+        value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        return card
+
+    def _create_text_card(self, title: str, value: str) -> QWidget:
+        card = QFrame()
+        card.setObjectName("FileDetailTextCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(8)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("FileDetailTextTitle")
+
+        text_box = QPlainTextEdit()
+        text_box.setObjectName("FileDetailTextBox")
+        text_box.setReadOnly(True)
+        text_box.setPlainText(value or "-")
+        text_box.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        text_box.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        text_box.setMinimumHeight(64)
+
+        metrics = text_box.fontMetrics()
+        line_count = max(1, len((value or "-").splitlines()))
+        content_height = (metrics.lineSpacing() * min(line_count, 6)) + 28
+        text_box.setFixedHeight(max(64, min(content_height, 176)))
+
+        layout.addWidget(title_label)
+        layout.addWidget(text_box)
+        return card
+
+    def showEvent(self, event) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.resize(parent.size())
+            self.move(parent.mapToGlobal(QPoint(0, 0)))
+        if self._blur_target is not None and self._blur_target.graphicsEffect() is None:
+            blur = QGraphicsBlurEffect(self._blur_target)
+            blur.setBlurRadius(8.0)
+            self._blur_target.setGraphicsEffect(blur)
+            self._owns_blur_effect = True
+            self._blur_effect = blur
+        super().showEvent(event)
+        QTimer.singleShot(0, self._start_open_animation)
+
+    def done(self, result: int) -> None:
+        if self._is_finalizing:
+            self._clear_blur()
+            super().done(result)
+            return
+        self._close_result = result
+        self._start_close_animation()
+
+    def hideEvent(self, event) -> None:
+        self._clear_blur()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if not self._is_finalizing:
+            event.ignore()
+            self.done(QDialog.Accepted)
+            return
+        self._clear_blur()
+        super().closeEvent(event)
+
+    def _clear_blur(self) -> None:
+        if self._owns_blur_effect and self._blur_target is not None:
+            self._blur_target.setGraphicsEffect(None)
+            self._owns_blur_effect = False
+        self._blur_effect = None
+
+    @staticmethod
+    def _scaled_rect(rect: QRect, scale: float) -> QRect:
+        width = max(1, int(rect.width() * scale))
+        height = max(1, int(rect.height() * scale))
+        center = rect.center()
+        scaled = QRect(0, 0, width, height)
+        scaled.moveCenter(center)
+        return scaled
+
+    def _start_open_animation(self) -> None:
+        if self._open_animation_started:
+            return
+        end_rect = self.card.geometry()
+        if not end_rect.isValid():
+            return
+
+        self._open_animation_started = True
+        start_rect = self._scaled_rect(end_rect, 0.985)
+        self.card.setGeometry(start_rect)
+        self.setWindowOpacity(0.0)
+
+        animation = QParallelAnimationGroup(self)
+
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(170)
+        opacity_animation.setStartValue(0.0)
+        opacity_animation.setEndValue(1.0)
+        opacity_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(180)
+        geometry_animation.setStartValue(start_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+        animation.start()
+        self._open_animation = animation
+
+    def _start_close_animation(self) -> None:
+        if self._is_finalizing:
+            return
+
+        current_rect = self.card.geometry()
+        if not current_rect.isValid():
+            self._finalize_close()
+            return
+
+        end_rect = self._scaled_rect(current_rect, 0.99)
+        animation = QParallelAnimationGroup(self)
+
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(140)
+        opacity_animation.setStartValue(self.windowOpacity())
+        opacity_animation.setEndValue(0.0)
+        opacity_animation.setEasingCurve(QEasingCurve.InCubic)
+
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(140)
+        geometry_animation.setStartValue(current_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.InCubic)
+
+        animation.finished.connect(self._finalize_close)
+        animation.start()
+        self._close_animation = animation
+
+    def _finalize_close(self) -> None:
+        if self._is_finalizing:
+            return
+        self._is_finalizing = True
+        try:
+            self._clear_blur()
+            super().done(self._close_result)
+        finally:
+            self._is_finalizing = False
+
+    def _copy_selected_path(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None and hasattr(parent, "copy_selected_path"):
+            parent.copy_selected_path()
+
+    def _trigger_compare_action(self, operation: str) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        callback = getattr(parent, "copy_to_compare_folders" if operation == "copy" else "move_to_compare_folders", None)
+        if callback is None:
+            return
+        self.done(QDialog.Accepted)
+        QTimer.singleShot(180, callback)
+
+
 class ProcessingOverlayDialog(QDialog):
     def __init__(self, parent: Optional[QWidget], title: str, summary: str) -> None:
         super().__init__(parent)
@@ -1727,6 +2222,9 @@ class SafeApplication(QApplication):
         try:
             return super().notify(receiver, event)
         except Exception as exc:
+            sys.stderr.write(
+                "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + os.linesep
+            )
             self.report_error(
                 "Terjadi kesalahan pada antarmuka aplikasi",
                 str(exc) or exc.__class__.__name__,
@@ -1787,14 +2285,25 @@ class FolderCompareDeleteApp(QMainWindow):
         self.history_limit = 200
         self.undo_stack: List[UndoAction] = []
         self.undo_limit = 20
-        self.undo_root = Path(tempfile.gettempdir()) / "folder_compare_delete_app_undo"
-        self.sidebar_icon_cache_dir = Path(tempfile.gettempdir()) / "folder_compare_delete_sidebar_icons"
+        
+        self.app_data_dir = Path.home() / ".folder_compare_app"
+        self.app_data_dir.mkdir(parents=True, exist_ok=True)
+        self.undo_root = self.app_data_dir / "folder_compare_delete_app_undo"
+        self.undo_root.mkdir(parents=True, exist_ok=True)
+        self.trash_db_path = self.app_data_dir / "trash_db.json"
+        self.trash_entries: List[TrashEntry] = []
+        self.sidebar_icon_cache_dir = self.app_data_dir / "folder_compare_delete_sidebar_icons"
+        self.file_detail_dialog: Optional[FileDetailOverlayDialog] = None
+        
+        # Load local database for internal app trash
+        self._load_trash_db()
 
         self.stat_labels: Dict[str, QLabel] = {}
         self.detail_labels: Dict[str, QLabel] = {}
 
         self._build_ui()
         self._apply_styles()
+        self._update_trash_sidebar_badge()
         self.progress_animation = QPropertyAnimation(self.progress_bar, b"value", self)
         self.progress_animation.setEasingCurve(QEasingCurve.OutCubic)
         self.progress_animation.finished.connect(self._on_progress_animation_finished)
@@ -1823,6 +2332,12 @@ class FolderCompareDeleteApp(QMainWindow):
         self._update_delete_action_controls()
         self.add_compare_folder_row()
         self.add_compare_folder_row()
+
+    def closeEvent(self, event) -> None:
+        # Trash internal dibuat persisten antar sesi, jadi saat aplikasi ditutup
+        # kita hanya menyimpan indeksnya dan tidak membersihkan file-file trash.
+        self._save_trash_db()
+        super().closeEvent(event)
 
     def _build_sidebar(self) -> QWidget:
         dock = QWidget()
@@ -1866,21 +2381,29 @@ class FolderCompareDeleteApp(QMainWindow):
         self.btn_nav_trash.setCursor(Qt.PointingHandCursor)
         self.btn_nav_trash.clicked.connect(lambda: self._switch_page(2))
         self.btn_nav_trash.setFixedSize(44, 44)
+        self.trash_nav_host = QWidget()
+        self.trash_nav_host.setObjectName("SidebarBadgeHost")
+        self.trash_nav_host.setFixedSize(56, 56)
+        self.btn_nav_trash.setParent(self.trash_nav_host)
+        self.btn_nav_trash.move(6, 6)
+        self.trash_nav_badge = QLabel("0", self.trash_nav_host)
+        self.trash_nav_badge.setObjectName("SidebarBadge")
+        self.trash_nav_badge.setAlignment(Qt.AlignCenter)
+        self.trash_nav_badge.setFixedHeight(22)
+        self.trash_nav_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.trash_nav_badge.hide()
+        self.trash_nav_badge.raise_()
 
         layout.addWidget(self.btn_nav_dashboard, 0, Qt.AlignHCenter)
         layout.addWidget(self.btn_nav_history, 0, Qt.AlignHCenter)
-        layout.addWidget(self.btn_nav_trash, 0, Qt.AlignHCenter)
+        layout.addWidget(self.trash_nav_host, 0, Qt.AlignHCenter)
         layout.addStretch(1)
-
-        sidebar_hint = QLabel("NAV")
-        sidebar_hint.setObjectName("SidebarHint")
-        sidebar_hint.setAlignment(Qt.AlignCenter)
-        layout.addWidget(sidebar_hint)
 
         dock_layout.addWidget(sidebar, 0, Qt.AlignHCenter)
         dock_layout.addStretch(1)
 
         self._apply_sidebar_icons(active_index=0)
+        self._update_trash_sidebar_badge()
         return dock
 
     def _build_ui(self) -> None:
@@ -1924,35 +2447,14 @@ class FolderCompareDeleteApp(QMainWindow):
         self.page_history = QWidget()
         page_hist_layout = QVBoxLayout(self.page_history)
         page_hist_layout.setContentsMargins(0, 0, 0, 0)
-
-        history_card = QFrame()
-        history_card.setObjectName("SurfaceCard")
-        history_layout = QVBoxLayout(history_card)
-        history_layout.setContentsMargins(24, 24, 24, 24)
-        history_layout.addWidget(self._build_history_panel())
-        
-        page_hist_layout.addWidget(history_card, 1)
+        page_hist_layout.addWidget(self._build_history_panel(), 1)
         self.main_stack.addWidget(self.page_history)
 
         self.page_trash = QWidget()
         page_trash_layout = QVBoxLayout(self.page_trash)
         page_trash_layout.setContentsMargins(0, 0, 0, 0)
         
-        trash_card = QFrame()
-        trash_card.setObjectName("SurfaceCard")
-        trash_layout = QVBoxLayout(trash_card)
-        trash_layout.setContentsMargins(24, 24, 24, 24)
-        
-        trash_title = QLabel("Trash Internal Aplikasi (File Terhapus)")
-        trash_title.setObjectName("SectionTitle")
-        trash_layout.addWidget(trash_title)
-        
-        trash_desc = QLabel("File yang Anda hapus pada mode Trash Internal akan dipindahkan ke tempat penampungan sementara ini. Anda bisa me-restore fitur tersebut menggunakan tombol Undo, atau mengosongkan trash dari sini.")
-        trash_desc.setWordWrap(True)
-        trash_layout.addWidget(trash_desc)
-        trash_layout.addStretch(1)
-        
-        page_trash_layout.addWidget(trash_card, 1)
+        page_trash_layout.addWidget(self._build_trash_page(), 1)
         self.main_stack.addWidget(self.page_trash)
 
         content_layout.addWidget(self.main_stack, 1)
@@ -1995,6 +2497,32 @@ class FolderCompareDeleteApp(QMainWindow):
         self._refresh_widget_style(self.btn_nav_history)
         self._refresh_widget_style(self.btn_nav_trash)
         self._apply_sidebar_icons(active_index=index)
+
+    def _update_trash_sidebar_badge(self) -> None:
+        if not hasattr(self, "trash_nav_badge") or not hasattr(self, "btn_nav_trash"):
+            return
+
+        count = len(self.trash_entries)
+        if count <= 0:
+            self.trash_nav_badge.hide()
+            self.btn_nav_trash.setToolTip("Trash Internal")
+            return
+
+        badge_text = "99+" if count > 99 else str(count)
+        badge_width = max(22, self.trash_nav_badge.fontMetrics().horizontalAdvance(badge_text) + 14)
+        self.trash_nav_badge.setText(badge_text)
+        self.trash_nav_badge.setFixedSize(badge_width, 22)
+
+        button_rect = self.btn_nav_trash.geometry()
+        badge_x = min(
+            self.trash_nav_host.width() - badge_width,
+            button_rect.x() + button_rect.width() - max(10, badge_width // 2),
+        )
+        badge_y = max(0, button_rect.y() - 4)
+        self.trash_nav_badge.move(badge_x, badge_y)
+        self.trash_nav_badge.show()
+        self.trash_nav_badge.raise_()
+        self.btn_nav_trash.setToolTip(f"Trash Internal ({count} file)")
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -2321,9 +2849,9 @@ class FolderCompareDeleteApp(QMainWindow):
         self.include_subfolders_checkbox = QCheckBox("Sertakan subfolder")
         self.include_subfolders_checkbox.setChecked(True)
         self.show_only_matches_checkbox = QCheckBox("Tampilkan hanya file dengan kecocokan / perbedaan")
-        self.delete_mode_recycle = QRadioButton("Hapus ke Recycle Bin")
+        self.delete_mode_internal_trash = QRadioButton("Hapus ke Trash Internal")
         self.delete_mode_permanent = QRadioButton("Hapus permanen")
-        self.delete_mode_recycle.setChecked(True)
+        self.delete_mode_internal_trash.setChecked(True)
         self.allow_delete_orange_checkbox = QCheckBox("Izinkan hapus hasil oranye (hanya di Folder A)")
         self.allow_delete_red_checkbox = QCheckBox("Izinkan hapus hasil merah (nama sama, isi berbeda)")
         self.delete_scope_hint_label = QLabel("Default aman: hanya hasil hijau yang dapat dihapus.")
@@ -2331,14 +2859,14 @@ class FolderCompareDeleteApp(QMainWindow):
         self.delete_scope_hint_label.setWordWrap(True)
 
         self.delete_mode_group = QButtonGroup(self)
-        self.delete_mode_group.addButton(self.delete_mode_recycle)
+        self.delete_mode_group.addButton(self.delete_mode_internal_trash)
         self.delete_mode_group.addButton(self.delete_mode_permanent)
 
         extra_layout.addWidget(extra_title)
         extra_layout.addWidget(self.include_subfolders_checkbox)
         extra_layout.addWidget(self.show_only_matches_checkbox)
         extra_layout.addSpacing(6)
-        extra_layout.addWidget(self.delete_mode_recycle)
+        extra_layout.addWidget(self.delete_mode_internal_trash)
         extra_layout.addWidget(self.delete_mode_permanent)
         extra_layout.addSpacing(6)
         extra_layout.addWidget(self.allow_delete_orange_checkbox)
@@ -2448,7 +2976,6 @@ class FolderCompareDeleteApp(QMainWindow):
         body_layout.addWidget(self._build_results_table())
         self.detail_panel = self._build_detail_panel()
         self.detail_panel.setVisible(False)
-        body_layout.addWidget(self.detail_panel)
         body_layout.addStretch(1)
 
         scroll.setWidget(body)
@@ -2583,6 +3110,7 @@ class FolderCompareDeleteApp(QMainWindow):
         selection_model = self.results_table.selectionModel()
         selection_model.selectionChanged.connect(self._on_table_selection_changed)
         selection_model.currentRowChanged.connect(self._on_current_row_changed)
+        self.results_table.doubleClicked.connect(self._open_detail_dialog_from_index)
         self.results_table.focusReleased.connect(self._on_table_focus_released)
 
         self.table_empty_state = self._build_table_empty_state()
@@ -2706,17 +3234,81 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def _build_history_panel(self) -> QWidget:
         card = QFrame()
-        card.setObjectName("SubCard")
-        card.setMinimumHeight(260)
+        card.setObjectName("SurfaceCard")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
 
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        hero = QFrame()
+        hero.setObjectName("HistoryHeroCard")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(20, 18, 20, 18)
+        hero_layout.setSpacing(14)
+
+        hero_top = QHBoxLayout()
+        hero_top.setSpacing(16)
+
+        hero_mark = QLabel("HS")
+        hero_mark.setObjectName("HistoryHeroMark")
+        hero_mark.setAlignment(Qt.AlignCenter)
+        hero_mark.setFixedSize(58, 58)
+
+        hero_text = QVBoxLayout()
+        hero_text.setSpacing(5)
 
         title = QLabel("Riwayat Aksi")
-        title.setObjectName("FieldLabel")
+        title.setObjectName("SectionTitle")
+
+        description = QLabel(
+            "Semua aksi penting aplikasi dicatat di sini, termasuk scan, hapus, salin, pindah, export, restore, dan status hasilnya."
+        )
+        description.setObjectName("SectionSubtitle")
+        description.setWordWrap(True)
+
+        self.history_summary_label = QLabel("Belum ada aktivitas yang tercatat.")
+        self.history_summary_label.setObjectName("HistoryHeroSummary")
+        self.history_summary_label.setWordWrap(True)
+
+        hero_text.addWidget(title)
+        hero_text.addWidget(description)
+        hero_text.addWidget(self.history_summary_label)
+
+        hero_top.addWidget(hero_mark, 0, Qt.AlignTop)
+        hero_top.addLayout(hero_text, 1)
+        hero_layout.addLayout(hero_top)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(12)
+
+        self.history_total_value = QLabel("0")
+        self.history_success_value = QLabel("0")
+        self.history_issue_value = QLabel("0")
+        self.history_undo_value = QLabel("0 siap")
+        metrics_row.addWidget(self._create_history_metric_card("Total Aksi", self.history_total_value, "Semua event yang tersimpan"))
+        metrics_row.addWidget(self._create_history_metric_card("Aksi Sukses", self.history_success_value, "Operasi yang selesai baik"))
+        metrics_row.addWidget(self._create_history_metric_card("Perlu Perhatian", self.history_issue_value, "Warning, sebagian gagal, atau error"))
+        metrics_row.addWidget(self._create_history_metric_card("Undo", self.history_undo_value, "Aksi terakhir yang masih bisa dibatalkan"))
+
+        hero_layout.addLayout(metrics_row)
+        layout.addWidget(hero)
+
+        table_card = QFrame()
+        table_card.setObjectName("SubCard")
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.setSpacing(14)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+
+        title_wrap = QVBoxLayout()
+        title_wrap.setSpacing(4)
+
+        section_title = QLabel("Timeline Aktivitas")
+        section_title.setObjectName("FieldLabel")
+        section_subtitle = QLabel("Tinjau aksi terbaru, statusnya, dan detail proses yang telah dijalankan aplikasi.")
+        section_subtitle.setObjectName("MutedText")
+        section_subtitle.setWordWrap(True)
 
         self.history_count_badge = QLabel("0 aksi")
         self.history_count_badge.setObjectName("HistoryCountBadge")
@@ -2732,7 +3324,10 @@ class FolderCompareDeleteApp(QMainWindow):
         self.clear_history_button.clicked.connect(self.clear_history)
         self.clear_history_button.setEnabled(False)
 
-        top.addWidget(title)
+        title_wrap.addWidget(section_title)
+        title_wrap.addWidget(section_subtitle)
+
+        top.addLayout(title_wrap, 1)
         top.addStretch(1)
         top.addWidget(self.history_count_badge)
         top.addWidget(self.undo_button)
@@ -2761,33 +3356,307 @@ class FolderCompareDeleteApp(QMainWindow):
         self.history_table.verticalHeader().setDefaultSectionSize(34)
         self.history_table.setMinimumHeight(220)
 
-        history_header = self.history_table.horizontalHeader()
-        history_header.setStretchLastSection(False)
-        history_header.setMinimumSectionSize(90)
-        history_header.setSectionsMovable(False)
-        for column in range(self.history_model.columnCount()):
-            history_header.setSectionResizeMode(column, QHeaderView.Interactive)
-
-        self.history_table.setColumnWidth(0, 145)
-        self.history_table.setColumnWidth(1, 180)
-        self.history_table.setColumnWidth(2, 100)
-        self.history_table.setColumnWidth(3, 520)
+        self._configure_history_table_columns()
 
         self.history_empty_state = self._build_history_empty_state()
         self.history_stack.addWidget(self.history_table)
         self.history_stack.addWidget(self.history_empty_state)
 
-        layout.addLayout(top)
-        layout.addWidget(self.history_stack_host)
+        table_layout.addLayout(top)
+        table_layout.addWidget(self.history_stack_host, 1)
+        layout.addWidget(table_card, 1)
         return card
+
+    def _create_history_metric_card(self, title: str, value_label: QLabel, subtitle: str) -> QWidget:
+        card = QFrame()
+        card.setObjectName("HistoryMetricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("HistoryMetricTitle")
+        value_label.setObjectName("HistoryMetricValue")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("HistoryMetricSubtitle")
+        subtitle_label.setWordWrap(True)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addWidget(subtitle_label)
+        return card
+
+    def _configure_history_table_columns(self) -> None:
+        if not hasattr(self, "history_table"):
+            return
+
+        history_header = self.history_table.horizontalHeader()
+        history_header.setStretchLastSection(False)
+        history_header.setMinimumSectionSize(90)
+        history_header.setSectionsMovable(False)
+
+        for column in range(self.history_model.columnCount()):
+            history_header.setSectionResizeMode(column, QHeaderView.Interactive)
+
+        # Kolom detail dibuat fleksibel agar tabel selalu mengisi lebar parent.
+        history_header.setSectionResizeMode(3, QHeaderView.Stretch)
+
+        self.history_table.setColumnWidth(0, 145)
+        self.history_table.setColumnWidth(1, 180)
+        self.history_table.setColumnWidth(2, 100)
+
+    def _build_trash_page(self) -> QWidget:
+        trash_card = QFrame()
+        trash_card.setObjectName("SurfaceCard")
+        trash_layout = QVBoxLayout(trash_card)
+        trash_layout.setContentsMargins(24, 24, 24, 24)
+        trash_layout.setSpacing(18)
+
+        hero = QFrame()
+        hero.setObjectName("TrashHeroCard")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(20, 18, 20, 18)
+        hero_layout.setSpacing(14)
+
+        hero_top = QHBoxLayout()
+        hero_top.setSpacing(16)
+
+        hero_mark = QLabel("TR")
+        hero_mark.setObjectName("TrashHeroMark")
+        hero_mark.setAlignment(Qt.AlignCenter)
+        hero_mark.setFixedSize(58, 58)
+
+        hero_text = QVBoxLayout()
+        hero_text.setSpacing(5)
+
+        title = QLabel("Trash Internal Aplikasi")
+        title.setObjectName("SectionTitle")
+        description = QLabel(
+            "File yang dihapus dalam mode Trash Internal dipindahkan ke penyimpanan aman aplikasi. Anda dapat memulihkan file kapan saja atau menghapusnya permanen jika sudah tidak diperlukan."
+        )
+        description.setObjectName("SectionSubtitle")
+        description.setWordWrap(True)
+
+        self.trash_summary_label = QLabel("Trash masih kosong dan siap dipakai.")
+        self.trash_summary_label.setObjectName("TrashHeroSummary")
+        self.trash_summary_label.setWordWrap(True)
+
+        hero_text.addWidget(title)
+        hero_text.addWidget(description)
+        hero_text.addWidget(self.trash_summary_label)
+
+        hero_top.addWidget(hero_mark, 0, Qt.AlignTop)
+        hero_top.addLayout(hero_text, 1)
+        hero_layout.addLayout(hero_top)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(12)
+
+        self.trash_count_value = QLabel("0")
+        self.trash_size_value = QLabel("0 B")
+        self.trash_selection_value = QLabel("0 dipilih")
+        metrics_row.addWidget(self._create_trash_metric_card("Item Trash", self.trash_count_value, "Jumlah file yang tersimpan"))
+        metrics_row.addWidget(self._create_trash_metric_card("Total Ukuran", self.trash_size_value, "Estimasi ruang yang dipakai"))
+        metrics_row.addWidget(self._create_trash_metric_card("Pilihan Aktif", self.trash_selection_value, "File yang akan diproses"))
+
+        hero_layout.addLayout(metrics_row)
+        trash_layout.addWidget(hero)
+
+        table_card = QFrame()
+        table_card.setObjectName("SubCard")
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.setSpacing(14)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+
+        top_title_wrap = QVBoxLayout()
+        top_title_wrap.setSpacing(4)
+        table_title = QLabel("Daftar File Trash")
+        table_title.setObjectName("FieldLabel")
+        table_subtitle = QLabel("Pilih file yang ingin dipulihkan kembali atau dihapus permanen dari Trash Internal.")
+        table_subtitle.setObjectName("MutedText")
+        table_subtitle.setWordWrap(True)
+        top_title_wrap.addWidget(table_title)
+        top_title_wrap.addWidget(table_subtitle)
+
+        actions_wrap = QHBoxLayout()
+        actions_wrap.setSpacing(10)
+
+        self.trash_restore_selected_button = QPushButton("Pulihkan Terpilih")
+        self.trash_restore_selected_button.setObjectName("GhostButton")
+        self.trash_restore_selected_button.clicked.connect(self.restore_selected_trash_entries)
+
+        self.trash_delete_selected_button = QPushButton("Hapus Permanen Terpilih")
+        self.trash_delete_selected_button.setObjectName("DangerButton")
+        self.trash_delete_selected_button.clicked.connect(self.delete_selected_trash_entries_permanently)
+
+        self.trash_delete_all_button = QPushButton("Kosongkan Trash")
+        self.trash_delete_all_button.setObjectName("DangerButton")
+        self.trash_delete_all_button.clicked.connect(self.delete_all_trash_entries_permanently)
+
+        actions_wrap.addWidget(self.trash_restore_selected_button)
+        actions_wrap.addWidget(self.trash_delete_selected_button)
+        actions_wrap.addWidget(self.trash_delete_all_button)
+
+        top_row.addLayout(top_title_wrap, 1)
+        top_row.addLayout(actions_wrap)
+
+        self.trash_table = QTableWidget(0, 6)
+        self.trash_table.setObjectName("TrashTable")
+        self.trash_table.setHorizontalHeaderLabels(["Pilih", "Nama File", "Path Asal", "Waktu Hapus", "Ukuran", "Undo"])
+        self.trash_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.trash_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.trash_table.setAlternatingRowColors(False)
+        self.trash_table.setWordWrap(False)
+        self.trash_table.setTextElideMode(Qt.ElideMiddle)
+        self.trash_table.setShowGrid(True)
+        self.trash_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.trash_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.trash_table.verticalHeader().setVisible(False)
+        self.trash_table.verticalHeader().setDefaultSectionSize(52)
+        self.trash_table.setMinimumHeight(300)
+        self._configure_trash_table_columns(apply_default_widths=True)
+        self.trash_table.cellClicked.connect(self._toggle_trash_row_check)
+
+        self.trash_stack_host = QWidget()
+        self.trash_stack = QStackedLayout(self.trash_stack_host)
+        self.trash_stack.setContentsMargins(0, 0, 0, 0)
+        self.trash_stack.setStackingMode(QStackedLayout.StackOne)
+
+        self.trash_empty_state = self._build_trash_empty_state()
+        self.trash_stack.addWidget(self.trash_table)
+        self.trash_stack.addWidget(self.trash_empty_state)
+
+        table_layout.addLayout(top_row)
+        table_layout.addWidget(self.trash_stack_host, 1)
+        trash_layout.addWidget(table_card, 1)
+
+        self._refresh_trash_page()
+        return trash_card
+
+    def _configure_trash_table_columns(self, apply_default_widths: bool = False) -> None:
+        if not hasattr(self, "trash_table"):
+            return
+
+        trash_header = self.trash_table.horizontalHeader()
+        trash_header.setStretchLastSection(False)
+        trash_header.setMinimumSectionSize(72)
+        trash_header.setSectionsMovable(False)
+
+        for column in range(self.trash_table.columnCount()):
+            trash_header.setSectionResizeMode(column, QHeaderView.Interactive)
+
+        # Path asal menyerap sisa ruang agar tabel responsif terhadap parent.
+        trash_header.setSectionResizeMode(2, QHeaderView.Stretch)
+
+        if apply_default_widths:
+            default_widths = {
+                0: 56,
+                1: 220,
+                3: 170,
+                4: 100,
+                5: 116,
+            }
+            for column, width in default_widths.items():
+                self.trash_table.setColumnWidth(column, width)
+
+    def _create_trash_undo_button(self, entry_id: str) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(0)
+
+        restore_button = QPushButton("Undo")
+        restore_button.setObjectName("TableGhostButton")
+        restore_button.setCursor(Qt.PointingHandCursor)
+        restore_button.setMinimumWidth(84)
+        restore_button.setMinimumHeight(30)
+        restore_button.clicked.connect(lambda _checked=False, target_entry_id=entry_id: self.restore_trash_entries([target_entry_id]))
+
+        layout.addWidget(restore_button, 0, Qt.AlignCenter)
+        return container
+
+    def _create_trash_checkbox(self, entry_id: str, checked: bool = False) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        checkbox = QCheckBox()
+        checkbox.setCursor(Qt.PointingHandCursor)
+        checkbox.setChecked(checked)
+        checkbox.setProperty("trashEntryId", entry_id)
+        checkbox.toggled.connect(lambda _checked=False: self._update_trash_selection_state())
+
+        layout.addWidget(checkbox, 0, Qt.AlignCenter)
+        return container
+
+    def _create_trash_metric_card(self, title: str, value_label: QLabel, subtitle: str) -> QWidget:
+        card = QFrame()
+        card.setObjectName("TrashMetricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("TrashMetricTitle")
+        value_label.setObjectName("TrashMetricValue")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("TrashMetricSubtitle")
+        subtitle_label.setWordWrap(True)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addWidget(subtitle_label)
+        return card
+
+    def _build_trash_empty_state(self) -> QWidget:
+        empty = QFrame()
+        empty.setObjectName("TrashEmptyState")
+        layout = QVBoxLayout(empty)
+        layout.setContentsMargins(24, 30, 24, 30)
+        layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignCenter)
+
+        icon = QLabel("[]")
+        icon.setObjectName("TrashEmptyIcon")
+        icon.setAlignment(Qt.AlignCenter)
+
+        title = QLabel("Trash Internal Masih Kosong")
+        title.setObjectName("TrashEmptyTitle")
+        title.setAlignment(Qt.AlignCenter)
+
+        description = QLabel(
+            "Saat Anda menghapus file dengan mode Trash Internal, file akan muncul di halaman ini untuk dipulihkan atau dihapus permanen."
+        )
+        description.setObjectName("TrashEmptyDescription")
+        description.setAlignment(Qt.AlignCenter)
+        description.setWordWrap(True)
+
+        hint = QLabel("Tip: gunakan mode Trash Internal jika Anda ingin aman untuk undo dan restore antar sesi.")
+        hint.setObjectName("TrashEmptyHint")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+
+        layout.addWidget(icon)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(hint)
+        return empty
 
     def _build_history_empty_state(self) -> QWidget:
         empty = QFrame()
         empty.setObjectName("HistoryEmptyState")
         layout = QVBoxLayout(empty)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setContentsMargins(24, 30, 24, 30)
         layout.setSpacing(10)
         layout.setAlignment(Qt.AlignCenter)
+
+        icon = QLabel("::")
+        icon.setObjectName("HistoryEmptyIcon")
+        icon.setAlignment(Qt.AlignCenter)
 
         title = QLabel("Belum ada riwayat aksi")
         title.setObjectName("HistoryEmptyTitle")
@@ -2800,8 +3669,15 @@ class FolderCompareDeleteApp(QMainWindow):
         description.setAlignment(Qt.AlignCenter)
         description.setWordWrap(True)
 
+        hint = QLabel("Mulai dari scan folder atau aksi file lain untuk membangun timeline aktivitas di halaman ini.")
+        hint.setObjectName("HistoryEmptyHint")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+
+        layout.addWidget(icon)
         layout.addWidget(title)
         layout.addWidget(description)
+        layout.addWidget(hint)
         return empty
 
     def _create_detail_card(self, key: str, title: str) -> QWidget:
@@ -2875,8 +3751,11 @@ class FolderCompareDeleteApp(QMainWindow):
     def _stylesheet_url(self, path: Path) -> str:
         return path.resolve().as_posix()
 
+    def _asset_path(self, name: str) -> Path:
+        return Path(__file__).resolve().parent / "assets" / name
+
     def _sidebar_icon_variant(self, source_name: str, color: str) -> Path:
-        source_path = Path(__file__).with_name(source_name)
+        source_path = self._asset_path(source_name)
         self.sidebar_icon_cache_dir.mkdir(parents=True, exist_ok=True)
         variant_path = self.sidebar_icon_cache_dir / f"{source_path.stem}_{color.strip('#')}.svg"
         try:
@@ -2901,9 +3780,9 @@ class FolderCompareDeleteApp(QMainWindow):
             button.setIconSize(QSize(18, 18))
 
     def _apply_styles(self) -> None:
-        checkbox_check_url = self._stylesheet_url(Path(__file__).with_name("checkbox_check.svg"))
-        sort_up_url = self._stylesheet_url(Path(__file__).with_name("sort_up.svg"))
-        sort_down_url = self._stylesheet_url(Path(__file__).with_name("sort_down.svg"))
+        checkbox_check_url = self._stylesheet_url(self._asset_path("checkbox_check.svg"))
+        sort_up_url = self._stylesheet_url(self._asset_path("sort_up.svg"))
+        sort_down_url = self._stylesheet_url(self._asset_path("sort_down.svg"))
         self.setStyleSheet(
             f"""
             QMainWindow {{
@@ -3013,6 +3892,74 @@ class FolderCompareDeleteApp(QMainWindow):
                 color: {MUTED};
                 font: 9.5pt "Segoe UI";
             }}
+            QFrame#TrashHeroCard {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f8fbff, stop:1 #eef5ff);
+                border: 1px solid #d7e5fb;
+                border-radius: 22px;
+            }}
+            QFrame#HistoryHeroCard {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #f8fbff, stop:1 #eef4ff);
+                border: 1px solid #d7e3fa;
+                border-radius: 22px;
+            }}
+            QLabel#HistoryHeroMark {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #173a78, stop:1 #2b64e8);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 18px;
+                font: 700 16pt "Segoe UI";
+            }}
+            QLabel#HistoryHeroSummary {{
+                color: #35527a;
+                font: 600 9.5pt "Segoe UI";
+            }}
+            QLabel#TrashHeroMark {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2f66f1, stop:1 #5d8cff);
+                color: white;
+                border: 1px solid rgba(255, 255, 255, 0.28);
+                border-radius: 18px;
+                font: 700 18pt "Segoe UI";
+            }}
+            QLabel#TrashHeroSummary {{
+                color: #31547f;
+                font: 600 9.5pt "Segoe UI";
+            }}
+            QFrame#TrashMetricCard {{
+                background: rgba(255, 255, 255, 0.82);
+                border: 1px solid #dce7f8;
+                border-radius: 16px;
+            }}
+            QFrame#HistoryMetricCard {{
+                background: rgba(255, 255, 255, 0.84);
+                border: 1px solid #dce5f6;
+                border-radius: 16px;
+            }}
+            QLabel#HistoryMetricTitle {{
+                color: {MUTED};
+                font: 700 8.8pt "Segoe UI";
+                text-transform: uppercase;
+            }}
+            QLabel#HistoryMetricValue {{
+                color: {TEXT};
+                font: 700 17pt "Segoe UI Semibold";
+            }}
+            QLabel#HistoryMetricSubtitle {{
+                color: #6e7f9a;
+                font: 8.8pt "Segoe UI";
+            }}
+            QLabel#TrashMetricTitle {{
+                color: {MUTED};
+                font: 700 8.8pt "Segoe UI";
+                text-transform: uppercase;
+            }}
+            QLabel#TrashMetricValue {{
+                color: {TEXT};
+                font: 700 17pt "Segoe UI Semibold";
+            }}
+            QLabel#TrashMetricSubtitle {{
+                color: #6e7f9a;
+                font: 8.8pt "Segoe UI";
+            }}
             QLabel#FieldLabel {{
                 font: 700 10pt "Segoe UI";
                 color: {TEXT};
@@ -3075,6 +4022,17 @@ class FolderCompareDeleteApp(QMainWindow):
                 border: 1px solid #dce6fb;
             }}
             QPushButton#GhostButton:hover {{
+                background: #e2ecff;
+            }}
+            QPushButton#TableGhostButton {{
+                background: #edf3ff;
+                color: {TEXT};
+                border: 1px solid #dce6fb;
+                border-radius: 10px;
+                padding: 6px 12px;
+                font: 600 9pt "Segoe UI";
+            }}
+            QPushButton#TableGhostButton:hover {{
                 background: #e2ecff;
             }}
             QPushButton#OutlineButton {{
@@ -3249,6 +4207,9 @@ class FolderCompareDeleteApp(QMainWindow):
                 font: 700 7pt "Segoe UI";
                 letter-spacing: 1.4px;
             }}
+            QWidget#SidebarBadgeHost {{
+                background: transparent;
+            }}
             QPushButton#SidebarButton {{
                 background: rgba(255, 255, 255, 0.04);
                 border: 1px solid transparent;
@@ -3266,6 +4227,15 @@ class FolderCompareDeleteApp(QMainWindow):
                 border-radius: 14px;
                 color: #ffffff;
                 padding: 0;
+            }}
+            QLabel#SidebarBadge {{
+                background: #f51212;
+                color: #ffffff;
+                border: 2px solid #13213b;
+                border-radius: 11px;
+                font: 800 8pt "Segoe UI";
+                padding: 0 2px;
+                padding-bottom: 2px;
             }}
             QProgressBar {{
                 background: #edf2fb;
@@ -3351,6 +4321,11 @@ class FolderCompareDeleteApp(QMainWindow):
                 border: 1px dashed #d4def1;
                 border-radius: 16px;
             }}
+            QLabel#HistoryEmptyIcon {{
+                color: #8ca7d7;
+                font: 700 22pt "Consolas";
+                letter-spacing: 3px;
+            }}
             QLabel#EmptyStateIcon {{
                 color: #8eabdd;
                 font: 700 22pt "Consolas";
@@ -3372,6 +4347,32 @@ class FolderCompareDeleteApp(QMainWindow):
                 color: {MUTED};
                 font: 9.2pt "Segoe UI";
             }}
+            QLabel#HistoryEmptyHint {{
+                color: #5c77ab;
+                font: 600 9pt "Segoe UI";
+            }}
+            QFrame#TrashEmptyState {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #fbfdff, stop:1 #f2f7ff);
+                border: 1px dashed #d5e1f4;
+                border-radius: 18px;
+            }}
+            QLabel#TrashEmptyIcon {{
+                color: #8aa8dc;
+                font: 700 22pt "Consolas";
+                letter-spacing: 3px;
+            }}
+            QLabel#TrashEmptyTitle {{
+                color: {TEXT};
+                font: 700 13pt "Segoe UI Semibold";
+            }}
+            QLabel#TrashEmptyDescription {{
+                color: {MUTED};
+                font: 9.5pt "Segoe UI";
+            }}
+            QLabel#TrashEmptyHint {{
+                color: #5b78b0;
+                font: 600 9pt "Segoe UI";
+            }}
             QLabel#DetailTitle {{
                 color: {MUTED};
                 font: 700 9pt "Segoe UI";
@@ -3390,6 +4391,32 @@ class FolderCompareDeleteApp(QMainWindow):
             }}
             QTableView#HistoryTable {{
                 border-radius: 14px;
+            }}
+            QTableWidget#TrashTable {{
+                background: #fbfdff;
+                color: {TEXT};
+                border: 1px solid #dbe4f4;
+                border-radius: 16px;
+                gridline-color: #e8eef8;
+                font: 9pt "Segoe UI";
+            }}
+            QTableWidget#TrashTable::item {{
+                padding: 6px 8px;
+            }}
+            QTableWidget#TrashTable QTableCornerButton::section {{
+                background: #f2f6fd;
+                border: none;
+                border-right: 1px solid #e3eaf7;
+                border-bottom: 1px solid #e3eaf7;
+            }}
+            QTableWidget#TrashTable QHeaderView::section {{
+                background: #f2f6fd;
+                color: {TEXT};
+                padding: 11px 16px 11px 8px;
+                border: none;
+                border-right: 1px solid #e3eaf7;
+                border-bottom: 1px solid #e3eaf7;
+                font: 700 9pt "Segoe UI";
             }}
             QLabel#PathStatus {{
                 font: 8.8pt "Segoe UI";
@@ -3627,7 +4654,7 @@ class FolderCompareDeleteApp(QMainWindow):
         return "hash" if self.compare_mode_hash.isChecked() else "name_size"
 
     def _current_delete_mode(self) -> str:
-        return "permanent" if self.delete_mode_permanent.isChecked() else "recycle_bin"
+        return "permanent" if self.delete_mode_permanent.isChecked() else "internal_trash"
 
     def _is_result_deletable(self, result: MatchResult) -> bool:
         if result.exact_matches:
@@ -4191,6 +5218,7 @@ class FolderCompareDeleteApp(QMainWindow):
         deleted_count = int(payload_map.get("deleted_count", len(deleted_paths)))
         errors = [str(item) for item in payload_map.get("errors", [])]
         undo_payload = payload_map.get("undo_action") if isinstance(payload_map.get("undo_action"), dict) else None
+        trash_entries_payload = payload_map.get("trash_entries", []) if isinstance(payload_map.get("trash_entries", []), list) else []
         active_delete_dialog = self.delete_confirm_dialog
 
         if active_delete_dialog is not None and not errors:
@@ -4211,6 +5239,7 @@ class FolderCompareDeleteApp(QMainWindow):
         remaining = self.table_proxy.rowCount()
         self.status_label.setText(f"Selesai menghapus {deleted_count} file. Sisa hasil terlihat: {remaining}.")
         self._set_delete_processing_state(False)
+        self._add_trash_entries([item for item in trash_entries_payload if isinstance(item, dict)])
 
         if self.result_rows and self.table_proxy.rowCount() > 0:
             QTimer.singleShot(40, self._finalize_table_layout_after_delete)
@@ -4355,6 +5384,8 @@ class FolderCompareDeleteApp(QMainWindow):
             )
             self._push_undo_action(undo_payload)
             error_preview = os.linesep.join(errors[:10])
+            if active_transfer_dialog is not None:
+                active_transfer_dialog.force_close(QDialog.Rejected)
             self.show_error_dialog(
                 title,
                 f"{processed_count} file berhasil {operation_label}, {error_count} file gagal diproses.",
@@ -4369,7 +5400,14 @@ class FolderCompareDeleteApp(QMainWindow):
             "success",
         )
         self._push_undo_action(undo_payload)
-        self.show_success_dialog(title, f"{processed_count} file berhasil {operation_label}.", os.linesep.join(detail_lines))
+        if active_transfer_dialog is not None:
+            active_transfer_dialog.show_success_state(
+                f"{processed_count} file berhasil {operation_label}.",
+                os.linesep.join(detail_lines),
+            )
+            active_transfer_dialog.flush_visual_state()
+        else:
+            self.show_success_dialog(title, f"{processed_count} file berhasil {operation_label}.", os.linesep.join(detail_lines))
 
     def _finalize_undo_results(self) -> None:
         payload_map = self._pending_undo_result or {}
@@ -4381,6 +5419,7 @@ class FolderCompareDeleteApp(QMainWindow):
         error_count = int(payload_map.get("error_count", 0))
         errors = [str(item) for item in payload_map.get("errors", [])]
         action_dir = str(payload_map.get("action_dir", ""))
+        restored_trash_entry_ids = [str(item) for item in payload_map.get("restored_trash_entry_ids", [])]
 
         self.undo_thread = None
         self._set_undo_processing_state(False)
@@ -4391,44 +5430,57 @@ class FolderCompareDeleteApp(QMainWindow):
         self._refresh_undo_button()
 
         if errors:
+            error_action = "Restore dari Trash" if label == "Pulihkan dari Trash Internal" else "Undo"
+            error_title = "Pemulihan Trash Belum Selesai" if label == "Pulihkan dari Trash Internal" else "Undo Belum Selesai"
+            error_summary = (
+                f"Pemulihan dari trash berhasil memulihkan {restored_count} operasi dan gagal pada {error_count} operasi."
+                if label == "Pulihkan dari Trash Internal"
+                else f"Undo untuk '{label}' berhasil memulihkan {restored_count} operasi dan gagal pada {error_count} operasi."
+            )
             self._record_history(
-                "Undo",
+                error_action,
                 "Sebagian gagal" if restored_count > 0 else "Gagal",
                 f"{label} | Berhasil: {restored_count} | Gagal: {error_count}",
                 "warning" if restored_count > 0 else "error",
             )
-            self.status_label.setText(f"Undo untuk '{label}' belum sepenuhnya berhasil.")
+            self.status_label.setText(
+                "Pemulihan file dari trash belum sepenuhnya berhasil."
+                if label == "Pulihkan dari Trash Internal"
+                else f"Undo untuk '{label}' belum sepenuhnya berhasil."
+            )
             self.show_error_dialog(
-                "Undo Belum Selesai",
-                f"Undo untuk '{label}' berhasil memulihkan {restored_count} operasi dan gagal pada {error_count} operasi.",
+                error_title,
+                error_summary,
                 f"{detail}{os.linesep}{os.linesep}{os.linesep.join(errors[:10])}",
             )
             return
 
+        self._remove_trash_entries(restored_trash_entry_ids)
+        self._remove_trash_entries_from_undo_stack(restored_trash_entry_ids)
         self._cleanup_undo_action_dir(action_dir)
-        self._record_history("Undo", "Sukses", f"{label} | Operasi dipulihkan: {restored_count}", "success")
-        recycle_note = ""
-        if label == "Penghapusan file" and "Mode: Recycle Bin" in detail:
-            recycle_note = (
-                "Catatan: undo penghapusan mode Recycle Bin memulihkan file dari backup internal aplikasi. "
-                "Item asli di Recycle Bin Windows mungkin masih ada dan dapat dihapus manual bila sudah tidak diperlukan."
-            )
-        if label in {"Penghapusan file", "Sinkronisasi folder pembanding", "Pindah file terpilih"}:
+        success_action = "Restore dari Trash" if label == "Pulihkan dari Trash Internal" else "Undo"
+        self._record_history(success_action, "Sukses", f"{label} | Operasi dipulihkan: {restored_count}", "success")
+        if label in {"Penghapusan file", "Sinkronisasi folder pembanding", "Pindah file terpilih", "Pulihkan dari Trash Internal"}:
             self.clear_results(reset_status=False)
-            status_text = f"Undo berhasil untuk aksi: {label}. Hasil scan dibersihkan, silakan scan ulang untuk melihat kondisi terbaru."
-            if recycle_note:
-                status_text = f"{status_text} Item asli di Recycle Bin mungkin masih ada."
-            self.status_label.setText(status_text)
+            if label == "Pulihkan dari Trash Internal":
+                self.status_label.setText(
+                    "File dari trash berhasil dipulihkan. Hasil scan dibersihkan, silakan scan ulang untuk melihat kondisi terbaru."
+                )
+            else:
+                self.status_label.setText(
+                    f"Undo berhasil untuk aksi: {label}. Hasil scan dibersihkan, silakan scan ulang untuk melihat kondisi terbaru."
+                )
         else:
-            self.status_label.setText(
-                f"Undo berhasil untuk aksi: {label}." + (" Item asli di Recycle Bin mungkin masih ada." if recycle_note else "")
-            )
+            if label == "Pulihkan dari Trash Internal":
+                self.status_label.setText("File dari trash berhasil dipulihkan.")
+            else:
+                self.status_label.setText(f"Undo berhasil untuk aksi: {label}.")
         success_details = f"{detail}{os.linesep}Operasi dipulihkan: {restored_count}"
-        if recycle_note:
-            success_details = f"{success_details}{os.linesep}{os.linesep}{recycle_note}"
         self.show_success_dialog(
-            "Undo Berhasil",
-            f"Aksi '{label}' berhasil dibatalkan.",
+            "Pemulihan Trash Berhasil" if label == "Pulihkan dari Trash Internal" else "Undo Berhasil",
+            "File yang dipilih berhasil dikembalikan dari trash internal."
+            if label == "Pulihkan dari Trash Internal"
+            else f"Aksi '{label}' berhasil dibatalkan.",
             success_details,
         )
 
@@ -4472,6 +5524,24 @@ class FolderCompareDeleteApp(QMainWindow):
     def _refresh_history_summary(self) -> None:
         count = len(self.history_entries)
         self.history_count_badge.setText(f"{count} aksi")
+        success_count = sum(1 for entry in self.history_entries if entry.tone == "success")
+        issue_count = sum(1 for entry in self.history_entries if entry.tone in {"warning", "error"})
+        if hasattr(self, "history_total_value"):
+            self.history_total_value.setText(str(count))
+        if hasattr(self, "history_success_value"):
+            self.history_success_value.setText(str(success_count))
+        if hasattr(self, "history_issue_value"):
+            self.history_issue_value.setText(str(issue_count))
+        if hasattr(self, "history_undo_value"):
+            self.history_undo_value.setText("1 siap" if self.undo_stack else "0 siap")
+        if hasattr(self, "history_summary_label"):
+            if count:
+                latest_entry = self.history_entries[0]
+                self.history_summary_label.setText(
+                    f"Aksi terbaru: {latest_entry.action} ({latest_entry.status}) pada {latest_entry.timestamp}."
+                )
+            else:
+                self.history_summary_label.setText("Belum ada aktivitas yang tercatat.")
         self.clear_history_button.setEnabled(count > 0)
         self._refresh_undo_button()
 
@@ -4500,6 +5570,337 @@ class FolderCompareDeleteApp(QMainWindow):
             self.undo_button.setToolTip(f"Batalkan aksi terakhir: {last_action.label}")
         else:
             self.undo_button.setToolTip("Belum ada aksi yang bisa di-undo.")
+
+    def _refresh_trash_page(self) -> None:
+        if not hasattr(self, "trash_table"):
+            return
+
+        entries = list(self.trash_entries)
+        selected_ids = set(self._selected_trash_entry_ids())
+        self.trash_table.setRowCount(len(entries))
+
+        total_size = sum(entry.size for entry in entries)
+        if hasattr(self, "trash_summary_label"):
+            self.trash_summary_label.setText(
+                f"{len(entries)} file tersimpan dengan total ukuran {self._format_size(total_size)}."
+                if entries
+                else "Trash masih kosong. File yang dihapus dengan mode ini akan tersimpan aman di sini."
+            )
+        if hasattr(self, "trash_count_value"):
+            self.trash_count_value.setText(str(len(entries)))
+        if hasattr(self, "trash_size_value"):
+            self.trash_size_value.setText(self._format_size(total_size))
+
+        for row_index, entry in enumerate(entries):
+            self.trash_table.setCellWidget(row_index, 0, self._create_trash_checkbox(entry.entry_id, entry.entry_id in selected_ids))
+
+            select_item = QTableWidgetItem()
+            select_item.setFlags(Qt.ItemIsEnabled)
+            select_item.setData(Qt.UserRole, entry.entry_id)
+            self.trash_table.setItem(row_index, 0, select_item)
+
+            file_name_item = QTableWidgetItem(Path(entry.original_path).name)
+            file_name_item.setToolTip(entry.original_path)
+            self.trash_table.setItem(row_index, 1, file_name_item)
+
+            original_path_item = QTableWidgetItem(entry.original_path)
+            original_path_item.setToolTip(entry.original_path)
+            self.trash_table.setItem(row_index, 2, original_path_item)
+
+            deleted_at_item = QTableWidgetItem(entry.deleted_at)
+            self.trash_table.setItem(row_index, 3, deleted_at_item)
+
+            size_item = QTableWidgetItem(self._format_size(entry.size))
+            size_item.setTextAlignment(Qt.AlignCenter)
+            self.trash_table.setItem(row_index, 4, size_item)
+
+            self.trash_table.setCellWidget(row_index, 5, self._create_trash_undo_button(entry.entry_id))
+
+        self.trash_stack.setCurrentWidget(self.trash_table if entries else self.trash_empty_state)
+        self.trash_delete_all_button.setEnabled(bool(entries))
+        self._update_trash_selection_state()
+        self._update_trash_sidebar_badge()
+        
+        # Simpan data terbaru ke json database setiap kali ada refresh
+        self._save_trash_db()
+
+    def _toggle_trash_row_check(self, row_index: int, column_index: int) -> None:
+        if column_index in {0, 5} or not hasattr(self, "trash_table"):
+            return
+
+        checkbox = self._trash_row_checkbox(row_index)
+        if checkbox is None:
+            return
+
+        checkbox.setChecked(not checkbox.isChecked())
+
+    def _update_trash_selection_state(self) -> None:
+        selected_count = len(self._selected_trash_entry_ids()) if hasattr(self, "trash_table") else 0
+        has_entries = bool(self.trash_entries)
+        if hasattr(self, "trash_selection_value"):
+            self.trash_selection_value.setText(f"{selected_count} dipilih")
+        if hasattr(self, "trash_restore_selected_button"):
+            self.trash_restore_selected_button.setEnabled(selected_count > 0)
+        if hasattr(self, "trash_delete_selected_button"):
+            self.trash_delete_selected_button.setEnabled(selected_count > 0)
+        if hasattr(self, "trash_delete_all_button"):
+            self.trash_delete_all_button.setEnabled(has_entries)
+
+    def _selected_trash_entry_ids(self) -> List[str]:
+        selected_ids: List[str] = []
+        if not hasattr(self, "trash_table"):
+            return selected_ids
+        for row_index in range(self.trash_table.rowCount()):
+            checkbox = self._trash_row_checkbox(row_index)
+            if checkbox is None or not checkbox.isChecked():
+                continue
+            entry_id = checkbox.property("trashEntryId")
+            if entry_id:
+                selected_ids.append(str(entry_id))
+        return selected_ids
+
+    def _trash_row_checkbox(self, row_index: int) -> Optional[QCheckBox]:
+        if not hasattr(self, "trash_table"):
+            return None
+
+        checkbox_host = self.trash_table.cellWidget(row_index, 0)
+        if checkbox_host is None:
+            return None
+        return checkbox_host.findChild(QCheckBox)
+
+    def _find_trash_entry(self, entry_id: str) -> Optional[TrashEntry]:
+        for entry in self.trash_entries:
+            if entry.entry_id == entry_id:
+                return entry
+        return None
+
+    def _trash_storage_dir(self) -> Path:
+        trash_dir = self.undo_root / "trash_items"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        return trash_dir
+
+    def _normalize_trash_entries(self) -> bool:
+        normalized_entries: List[TrashEntry] = []
+        seen_entry_ids: set[str] = set()
+        seen_trash_paths: set[str] = set()
+        changed = False
+
+        for entry in self.trash_entries:
+            entry_id = str(entry.entry_id).strip()
+            trash_path = str(Path(entry.trash_path))
+            if not entry_id or not trash_path:
+                changed = True
+                continue
+            if entry_id in seen_entry_ids or trash_path in seen_trash_paths:
+                changed = True
+                continue
+            if not Path(trash_path).exists():
+                changed = True
+                continue
+
+            seen_entry_ids.add(entry_id)
+            seen_trash_paths.add(trash_path)
+            normalized_entries.append(
+                TrashEntry(
+                    entry_id=entry_id,
+                    original_path=str(entry.original_path),
+                    trash_path=trash_path,
+                    deleted_at=str(entry.deleted_at),
+                    size=int(entry.size),
+                )
+            )
+
+        if changed or len(normalized_entries) != len(self.trash_entries):
+            self.trash_entries = normalized_entries
+            return True
+        return False
+
+    def _load_trash_db(self) -> None:
+        if not hasattr(self, "trash_db_path") or not self.trash_db_path.exists():
+            return
+        
+        try:
+            with open(self.trash_db_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for item in data:
+                        self.trash_entries.append(
+                            TrashEntry(
+                                entry_id=item.get("entry_id", ""),
+                                original_path=item.get("original_path", ""),
+                                trash_path=str(Path(item.get("trash_path", ""))),
+                                deleted_at=item.get("deleted_at", ""),
+                                size=item.get("size", 0),
+                            )
+                        )
+            if self._normalize_trash_entries():
+                self._save_trash_db()
+        except Exception as e:
+            print(f"Error loading trash DB: {e}")
+
+    def _save_trash_db(self) -> None:
+        if not hasattr(self, "trash_db_path"):
+            return
+            
+        try:
+            self._normalize_trash_entries()
+            # Pastikan folder app data ada
+            self.trash_db_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            data = [
+                {
+                    "entry_id": entry.entry_id,
+                    "original_path": entry.original_path,
+                    "trash_path": entry.trash_path,
+                    "deleted_at": entry.deleted_at,
+                    "size": entry.size,
+                }
+                for entry in self.trash_entries
+            ]
+            with open(self.trash_db_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error saving trash DB: {e}")
+
+    def _remove_trash_entries(self, entry_ids: List[str]) -> None:
+        if not entry_ids:
+            return
+        wanted = set(entry_ids)
+        self.trash_entries = [entry for entry in self.trash_entries if entry.entry_id not in wanted]
+        self._refresh_trash_page()
+
+    def _remove_trash_entries_from_undo_stack(self, entry_ids: List[str]) -> None:
+        if not entry_ids:
+            return
+        wanted = set(entry_ids)
+        updated_stack: List[UndoAction] = []
+        for action in self.undo_stack:
+            filtered_operations = [operation for operation in action.operations if operation.get("trash_entry_id") not in wanted]
+            if filtered_operations:
+                action.operations = filtered_operations
+                updated_stack.append(action)
+            else:
+                self._cleanup_undo_action_dir(action.action_dir)
+        self.undo_stack = updated_stack
+        self._refresh_undo_button()
+
+    def _add_trash_entries(self, payload_items: List[Dict[str, Any]]) -> None:
+        for item in payload_items:
+            entry_id = str(item.get("entry_id", "")).strip()
+            if not entry_id:
+                continue
+            self.trash_entries.append(
+                TrashEntry(
+                    entry_id=entry_id,
+                    original_path=str(item.get("original_path", "")),
+                    trash_path=str(item.get("trash_path", "")),
+                    deleted_at=str(item.get("deleted_at", "")),
+                    size=int(item.get("size", 0)),
+                )
+            )
+        self._normalize_trash_entries()
+        self._refresh_trash_page()
+
+    def restore_trash_entries(self, entry_ids: List[str]) -> None:
+        selected_entries = [entry for entry_id in entry_ids if (entry := self._find_trash_entry(entry_id)) is not None]
+        if not selected_entries:
+            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari trash untuk dipulihkan.")
+            return
+        if self.undo_thread and self.undo_thread.is_alive():
+            QMessageBox.information(self, APP_TITLE, "Undo sebelumnya masih berjalan.")
+            return
+
+        undo_action = UndoAction(
+            label="Pulihkan dari Trash Internal",
+            detail=f"Jumlah file: {len(selected_entries)}",
+            operations=[
+                self._serialize_undo_operation(
+                    "move_path",
+                    source=entry.trash_path,
+                    destination=entry.original_path,
+                    trash_entry_id=entry.entry_id,
+                )
+                for entry in selected_entries
+            ],
+        )
+
+        self.status_label.setText(f"Memulihkan {len(selected_entries)} file dari trash internal...")
+        self._record_history("Restore dari Trash", "Diproses", f"Jumlah file: {len(selected_entries)}", "info")
+        self._set_undo_processing_state(True)
+        self.undo_button.setEnabled(False)
+        dialog = ProcessingOverlayDialog(
+            self,
+            "Memulihkan File dari Trash",
+            f"Sedang mengembalikan {len(selected_entries)} file ke lokasi asal.",
+        )
+        self.undo_processing_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        self.undo_thread = threading.Thread(target=self._undo_worker, args=(undo_action,), daemon=True)
+        self.undo_thread.start()
+
+    def restore_selected_trash_entries(self) -> None:
+        self.restore_trash_entries(self._selected_trash_entry_ids())
+
+    def delete_selected_trash_entries_permanently(self) -> None:
+        entry_ids = self._selected_trash_entry_ids()
+        if not entry_ids:
+            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari trash untuk dihapus permanen.")
+            return
+
+        if QMessageBox.question(
+            self,
+            "Hapus Permanen dari Trash",
+            f"{len(entry_ids)} file di trash internal akan dihapus permanen. Lanjutkan?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted_count = 0
+        errors: List[str] = []
+        for entry_id in entry_ids:
+            entry = self._find_trash_entry(entry_id)
+            if entry is None:
+                continue
+            try:
+                trash_path = Path(entry.trash_path)
+                if trash_path.exists():
+                    trash_path.unlink()
+                deleted_count += 1
+            except Exception as exc:
+                errors.append(f"{entry.original_path}: {exc}")
+
+        self._remove_trash_entries(entry_ids)
+        self._remove_trash_entries_from_undo_stack(entry_ids)
+        self._record_history(
+            "Hapus permanen dari Trash",
+            "Sebagian gagal" if errors and deleted_count > 0 else "Sukses" if not errors else "Gagal",
+            f"Berhasil: {deleted_count} | Gagal: {len(errors)}",
+            "warning" if errors else "success",
+        )
+        if errors:
+            self.show_error_dialog(
+                "Hapus Permanen dari Trash Belum Selesai",
+                f"{deleted_count} file berhasil dihapus permanen, {len(errors)} file gagal diproses.",
+                os.linesep.join(errors[:10]),
+            )
+        else:
+            self.show_success_dialog(
+                "Trash Diperbarui",
+                f"{deleted_count} file berhasil dihapus permanen dari trash.",
+                "File yang sudah dihapus permanen tidak dapat dipulihkan kembali.",
+            )
+
+    def delete_all_trash_entries_permanently(self) -> None:
+        if not self.trash_entries:
+            QMessageBox.information(self, APP_TITLE, "Trash internal sudah kosong.")
+            return
+        for row_index in range(self.trash_table.rowCount()):
+            item = self.trash_table.item(row_index, 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked)
+        self.delete_selected_trash_entries_permanently()
 
     def _create_undo_action_dir(self, label: str) -> Path:
         safe_label = "".join(char if char.isalnum() else "_" for char in label.lower()).strip("_") or "aksi"
@@ -4593,6 +5994,7 @@ class FolderCompareDeleteApp(QMainWindow):
     def _undo_worker(self, action: UndoAction) -> None:
         restored_count = 0
         errors: List[str] = []
+        restored_trash_entry_ids: List[str] = []
 
         for operation in action.operations:
             kind = operation.get("kind", "")
@@ -4612,6 +6014,8 @@ class FolderCompareDeleteApp(QMainWindow):
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(source), str(destination))
                     restored_count += 1
+                    if operation.get("trash_entry_id"):
+                        restored_trash_entry_ids.append(str(operation["trash_entry_id"]))
                 elif kind == "restore_copy":
                     backup = Path(operation["backup"])
                     destination = Path(operation["destination"])
@@ -4637,6 +6041,7 @@ class FolderCompareDeleteApp(QMainWindow):
                     "error_count": len(errors),
                     "errors": errors,
                     "action_dir": action.action_dir,
+                    "restored_trash_entry_ids": restored_trash_entry_ids,
                 },
             )
         )
@@ -4784,6 +6189,9 @@ class FolderCompareDeleteApp(QMainWindow):
         if focus_widget is not None and hasattr(self, "detail_panel"):
             if focus_widget is self.detail_panel or self.detail_panel.isAncestorOf(focus_widget):
                 return
+        if focus_widget is not None and self.file_detail_dialog is not None and self.file_detail_dialog.isVisible():
+            if focus_widget is self.file_detail_dialog or self.file_detail_dialog.isAncestorOf(focus_widget):
+                return
         self.current_selected_result = None
         self._reset_detail_panel()
 
@@ -4811,7 +6219,6 @@ class FolderCompareDeleteApp(QMainWindow):
             return
 
         self.current_selected_result = result
-        self.detail_panel.setVisible(True)
         actual_missing_labels = self._actual_missing_compare_labels(result)
         self.detail_labels["status"].setText(result.status_text)
         self.detail_labels["target"].setText(str(result.target_path))
@@ -4822,7 +6229,59 @@ class FolderCompareDeleteApp(QMainWindow):
         self.detail_labels["mode"].setText(result.match_type)
         self.detail_labels["exact"].setText(result.exact_paths_text)
         self.detail_labels["diff"].setText(result.diff_paths_text)
-        self._refresh_missing_compare_suggestion(result)
+
+    def _compare_sync_suggestion_text(self, result: Optional[MatchResult]) -> str:
+        if result is None:
+            return ""
+
+        plan = self._compare_sync_plan(result)
+        create_labels = [label for label in plan["create_labels"] if label]
+        replace_labels = [label for label in plan["replace_labels"] if label]
+        if not plan["source"] or (not create_labels and not replace_labels):
+            return ""
+
+        if create_labels and replace_labels:
+            return (
+                f"File ini bisa disalin atau dipindahkan ke folder pembanding. "
+                f"Tujuan baru: {', '.join(create_labels)}. "
+                f"Tujuan yang akan diganti: {', '.join(replace_labels)}."
+            )
+        if replace_labels:
+            return (
+                "Versi file pada folder pembanding berbeda. "
+                f"Anda dapat menyalin atau memindahkan versi dari Folder A untuk menggantikan file di {', '.join(replace_labels)}."
+            )
+        return (
+            "File ini belum ada di beberapa folder pembanding. "
+            f"Anda dapat menyalin atau memindahkannya ke {', '.join(create_labels)}."
+        )
+
+    def _open_detail_dialog_from_index(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+
+        self._update_detail_from_row(index.row())
+        result = self.current_selected_result
+        if result is None:
+            return
+
+        missing_labels = self._actual_missing_compare_labels(result)
+        suggestion_text = self._compare_sync_suggestion_text(result)
+        plan = self._compare_sync_plan(result)
+        show_compare_actions = bool(plan["source"] and (plan["create_labels"] or plan["replace_labels"]))
+
+        dialog = FileDetailOverlayDialog(
+            self,
+            result,
+            missing_labels,
+            suggestion_text,
+            show_compare_actions=show_compare_actions,
+        )
+        self.file_detail_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self.file_detail_dialog = None
 
     def _reset_detail_panel(self) -> None:
         defaults = {
@@ -4943,29 +6402,10 @@ class FolderCompareDeleteApp(QMainWindow):
             self.missing_compare_suggestion.setVisible(False)
             return
 
-        plan = self._compare_sync_plan(result)
-        create_labels = [label for label in plan["create_labels"] if label]
-        replace_labels = [label for label in plan["replace_labels"] if label]
-        if not plan["source"] or (not create_labels and not replace_labels):
+        suggestion_text = self._compare_sync_suggestion_text(result)
+        if not suggestion_text:
             self.missing_compare_suggestion.setVisible(False)
             return
-
-        if create_labels and replace_labels:
-            suggestion_text = (
-                f"File ini bisa disalin atau dipindahkan ke folder pembanding. "
-                f"Tujuan baru: {', '.join(create_labels)}. "
-                f"Tujuan yang akan diganti: {', '.join(replace_labels)}."
-            )
-        elif replace_labels:
-            suggestion_text = (
-                "Versi file pada folder pembanding berbeda. "
-                f"Anda dapat menyalin atau memindahkan versi dari Folder A untuk menggantikan file di {', '.join(replace_labels)}."
-            )
-        else:
-            suggestion_text = (
-                "File ini belum ada di beberapa folder pembanding. "
-                f"Anda dapat menyalin atau memindahkannya ke {', '.join(create_labels)}."
-            )
 
         self.missing_compare_suggestion_label.setText(suggestion_text)
         self.missing_compare_suggestion.setVisible(True)
@@ -5205,20 +6645,35 @@ class FolderCompareDeleteApp(QMainWindow):
                 return candidate
             counter += 1
 
+    def _show_transfer_notice(self, title: str, summary: str, details: str = "") -> None:
+        self.show_error_dialog(title, summary, details)
+
     def transfer_selected_files(self, operation: str) -> None:
         if self.scan_thread and self.scan_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses scan selesai sebelum menyalin atau memindahkan file.")
+            self._show_transfer_notice(
+                "Aksi Belum Bisa Diproses",
+                "Tunggu sampai proses scan selesai sebelum menyalin atau memindahkan file.",
+            )
             return
         if self.delete_thread and self.delete_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses penghapusan selesai terlebih dahulu.")
+            self._show_transfer_notice(
+                "Aksi Belum Bisa Diproses",
+                "Tunggu sampai proses penghapusan selesai terlebih dahulu.",
+            )
             return
         if self.transfer_thread and self.transfer_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Proses salin/pindah file masih berjalan.")
+            self._show_transfer_notice(
+                "Aksi Belum Bisa Diproses",
+                "Proses salin/pindah file masih berjalan.",
+            )
             return
 
         selected_results = self._selected_results()
         if not selected_results:
-            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu item hasil scan untuk disalin atau dipindahkan.")
+            self._show_transfer_notice(
+                "Belum Ada Pilihan",
+                "Pilih minimal satu item hasil scan untuk disalin atau dipindahkan.",
+            )
             return
 
         source_entries: List[Tuple[str, str, str]] = []
@@ -5232,7 +6687,10 @@ class FolderCompareDeleteApp(QMainWindow):
                 source_entries.append((base_label, relative_path, str(path)))
 
         if not source_entries:
-            QMessageBox.information(self, APP_TITLE, "Tidak ada file sumber yang dapat diproses dari pilihan saat ini.")
+            self._show_transfer_notice(
+                "Tidak Ada File Sumber",
+                "Tidak ada file sumber yang dapat diproses dari pilihan saat ini.",
+            )
             return
 
         destination_root = QFileDialog.getExistingDirectory(
@@ -5245,26 +6703,90 @@ class FolderCompareDeleteApp(QMainWindow):
 
         operation_title = "Pindah File" if operation == "move" else "Salin File"
         operation_label = "dipindahkan" if operation == "move" else "disalin"
-        if QMessageBox.question(
+        details_lines = [
+            f"Jumlah file sumber: {len(source_entries)}",
+            f"Folder tujuan: {destination_root}",
+            "Struktur sumber akan dipertahankan berdasarkan label folder (A, F1, F2, dst).",
+        ]
+
+        confirm_dialog = ConfirmOverlayDialog(
             self,
             operation_title,
-            (
-                f"{len(source_entries)} file terkait akan {operation_label} ke folder tujuan terpilih.\n"
-                "Struktur sumber akan dipertahankan berdasarkan label folder (A, F1, F2, dst). Lanjutkan?"
-            ),
-        ) != QMessageBox.StandardButton.Yes:
+            f"{len(source_entries)} file terkait akan {operation_label} ke folder tujuan terpilih.",
+            "\n".join(details_lines),
+            detail_title="Rencana transfer",
+            confirm_button_text="Ya, Proses Transfer",
+            confirm_footnote="Pastikan folder tujuan sudah benar sebelum melanjutkan proses transfer file.",
+            processing_footnote="Transfer file sedang berjalan. Mohon tunggu sampai proses selesai.",
+            processing_button_text="Mentransfer",
+            success_title="Transfer File Berhasil",
+            success_detail_title="Ringkasan transfer",
+            success_footnote="Transfer selesai. Anda dapat menutup dialog ini.",
+        )
+        self.transfer_confirm_dialog = confirm_dialog
+        confirm_dialog.confirmRequested.connect(
+            lambda entries=list(source_entries), destination=str(destination_root), op=operation: self._start_selected_transfer_from_dialog(
+                entries,
+                destination,
+                op,
+            )
+        )
+
+        dialog_result = confirm_dialog.exec()
+        if self.transfer_confirm_dialog is confirm_dialog:
+            self.transfer_confirm_dialog = None
+        confirm_dialog.deleteLater()
+
+        if dialog_result != QDialog.Accepted:
             return
 
+    def _start_selected_transfer_from_dialog(
+        self,
+        source_entries: List[Tuple[str, str, str]],
+        destination_root: str,
+        operation: str,
+    ) -> None:
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            return
+
+        dialog = self.transfer_confirm_dialog
+        if dialog is None:
+            return
+
+        operation_text = "pemindahan" if operation == "move" else "penyalinan"
         self.status_label.setText(
             "Memproses pemindahan file terkait..." if operation == "move" else "Memproses penyalinan file terkait..."
         )
+        dialog.set_processing(
+            True,
+            f"Sedang memproses {operation_text} file ke folder tujuan. Mohon tunggu...",
+        )
         self._set_transfer_processing_state(True)
+        dialog.flush_visual_state()
         self._record_history(
             "Pindah file terpilih" if operation == "move" else "Salin file terpilih",
             "Diproses",
             f"Jumlah file sumber: {len(source_entries)}\nFolder tujuan: {destination_root}",
             "info",
         )
+
+        QTimer.singleShot(
+            0,
+            lambda entries=list(source_entries), destination=str(destination_root), op=operation: self._launch_selected_transfer_worker(
+                entries,
+                destination,
+                op,
+            ),
+        )
+
+    def _launch_selected_transfer_worker(
+        self,
+        source_entries: List[Tuple[str, str, str]],
+        destination_root: str,
+        operation: str,
+    ) -> None:
+        if self.transfer_thread and self.transfer_thread.is_alive():
+            return
         self.transfer_thread = threading.Thread(
             target=self._transfer_worker,
             args=(list(source_entries), destination_root, operation),
@@ -5437,7 +6959,7 @@ class FolderCompareDeleteApp(QMainWindow):
         scope_counts = self._delete_scope_counts(results)
         preview = "\n".join(f"[{result.status_text}] {result.target_path}" for result in results[:10])
         extra = "" if len(delete_paths) <= 10 else f"\n... dan {len(delete_paths) - 10} file lainnya"
-        mode_text = "Recycle Bin" if self._current_delete_mode() == "recycle_bin" else "hapus permanen"
+        mode_text = "Trash Internal" if self._current_delete_mode() == "internal_trash" else "hapus permanen"
         summary_lines = [
             f"Anda akan memproses {len(delete_paths)} file dari Folder A.",
             (
@@ -5486,55 +7008,77 @@ class FolderCompareDeleteApp(QMainWindow):
         self._record_history(
             "Penghapusan file",
             "Diproses",
-            f"Jumlah file: {len(paths)}\nMode: {'Recycle Bin' if self._current_delete_mode() == 'recycle_bin' else 'Permanen'}",
+            f"Jumlah file: {len(paths)}\nMode: {'Trash Internal' if self._current_delete_mode() == 'internal_trash' else 'Permanen'}",
             "warning",
         )
 
-        use_recycle_bin = self._current_delete_mode() == "recycle_bin"
+        use_internal_trash = self._current_delete_mode() == "internal_trash"
         QTimer.singleShot(
             0,
-            lambda delete_paths=list(paths), recycle_mode=use_recycle_bin: self._launch_delete_worker(
-                delete_paths, recycle_mode
+            lambda delete_paths=list(paths), trash_mode=use_internal_trash: self._launch_delete_worker(
+                delete_paths, trash_mode
             ),
         )
 
-    def _launch_delete_worker(self, paths: List[Path], use_recycle_bin: bool) -> None:
+    def _launch_delete_worker(self, paths: List[Path], use_internal_trash: bool) -> None:
         if self.delete_thread and self.delete_thread.is_alive():
             return
 
         self.delete_thread = threading.Thread(
             target=self._delete_worker,
-            args=(list(paths), use_recycle_bin),
+            args=(list(paths), use_internal_trash),
             daemon=True,
         )
         self.delete_thread.start()
 
-    def _delete_worker(self, paths: List[Path], use_recycle_bin: bool) -> None:
+    def _delete_worker(self, paths: List[Path], use_internal_trash: bool) -> None:
         deleted_count = 0
         deleted_paths: List[Path] = []
         errors: List[str] = []
         undo_payload: Optional[Dict[str, Any]] = None
         action_dir = self._create_undo_action_dir("delete")
         undo_operations: List[Dict[str, str]] = []
+        trash_entries_payload: List[Dict[str, Any]] = []
+        trash_storage_dir = self._trash_storage_dir()
 
         for path in paths:
             try:
                 if not path.exists() or not path.is_file():
                     raise FileNotFoundError(f"File tidak ditemukan: {path}")
-                backup_path = self._backup_file_for_undo(path, action_dir, "delete")
-                if use_recycle_bin:
-                    self._send_to_recycle_bin(path)
+                original_size = path.stat().st_size
+                if use_internal_trash:
+                    trash_target = trash_storage_dir / f"{uuid4().hex}{path.suffix}"
+                    shutil.move(str(path), str(trash_target))
+                    entry_id = uuid4().hex
+                    trash_entries_payload.append(
+                        {
+                            "entry_id": entry_id,
+                            "original_path": str(path),
+                            "trash_path": str(trash_target),
+                            "deleted_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                            "size": original_size,
+                        }
+                    )
+                    undo_operations.append(
+                        self._serialize_undo_operation(
+                            "move_path",
+                            source=str(trash_target),
+                            destination=str(path),
+                            trash_entry_id=entry_id,
+                        )
+                    )
                 else:
+                    backup_path = self._backup_file_for_undo(path, action_dir, "delete")
                     path.unlink()
+                    undo_operations.append(
+                        self._serialize_undo_operation(
+                            "restore_copy",
+                            backup=str(backup_path),
+                            destination=str(path),
+                        )
+                    )
                 deleted_count += 1
                 deleted_paths.append(path)
-                undo_operations.append(
-                    self._serialize_undo_operation(
-                        "restore_copy",
-                        backup=str(backup_path),
-                        destination=str(path),
-                    )
-                )
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
 
@@ -5543,7 +7087,7 @@ class FolderCompareDeleteApp(QMainWindow):
                 "label": "Penghapusan file",
                 "detail": (
                     f"Jumlah file: {deleted_count}\n"
-                    f"Mode: {'Recycle Bin' if use_recycle_bin else 'Permanen'}"
+                    f"Mode: {'Trash Internal' if use_internal_trash else 'Permanen'}"
                 ),
                 "operations": undo_operations,
                 "action_dir": str(action_dir),
@@ -5559,6 +7103,7 @@ class FolderCompareDeleteApp(QMainWindow):
                     "deleted_paths": [str(path) for path in deleted_paths],
                     "errors": errors,
                     "undo_action": undo_payload,
+                    "trash_entries": trash_entries_payload,
                 },
             )
         )
@@ -5730,15 +7275,8 @@ class FolderCompareDeleteApp(QMainWindow):
         self._record_history("Export Excel", "Sukses", save_path, "success")
         QMessageBox.information(self, APP_TITLE, f"Berhasil menyimpan Excel:\n{save_path}")
 
-    def _send_to_recycle_bin(self, path: Path) -> None:
-        try:
-            from send2trash import send2trash  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError("Paket 'send2trash' belum terpasang. Jalankan: pip install send2trash") from exc
-        send2trash(str(path))
-
-
 def _forward_exception_to_app(title: str, summary: str, details: str) -> None:
+    sys.stderr.write(f"{title}\n{summary}\n{details}\n")
     app = QApplication.instance()
     if isinstance(app, SafeApplication):
         app.report_error(title, summary, details)
