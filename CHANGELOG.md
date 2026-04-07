@@ -2,6 +2,18 @@
 
 Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
+## [2.3.0] - 2026-04-07
+
+### Ditambahkan
+- Sistem **Pembaruan Otomatis (Auto Updater)** terintegrasi dengan GitHub API untuk mengecek dan mengunduh rilis langsung dari dalam aplikasi.
+- Tombol *Sync* baru di sidebar untuk memeriksa pembaruan (Status dialog & Loading progress bar animasi).
+- Dukungan icon taskbar spesifik untuk Windows (`myappid`) serta `app_icon.png` bawaan untuk mencegah konflik icon dengan aplikasi python lain.
+- Layout dan visual Modernisasi untuk `FileDetailOverlayDialog` termasuk animasi hover tombol biru `PRIMARY`.
+
+### Diperbarui
+- Penyesuaian pada kolom riwayat/history `("Nama File")` untuk menampilkan detail yang lebih kontekstual pada nama file.
+- Penyelesaian masalah status sinkronisasi tabel (label yang tersalin/terpindah) sehingga tak lagi memerlukan scan manual berulang kali.
+
 ## [2.2.0] - 2026-04-04
 
 ### Ditambahkan

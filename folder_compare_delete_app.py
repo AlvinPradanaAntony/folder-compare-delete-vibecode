@@ -18,7 +18,7 @@ from uuid import uuid4
 
 try:
     from PySide6.QtCore import QAbstractAnimation, QAbstractTableModel, QEasingCurve, QItemSelectionModel, QModelIndex, QPoint, QPropertyAnimation, QParallelAnimationGroup, QRect, QSize, QSortFilterProxyModel, QTimer, Qt, Signal
-    from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent, QFocusEvent, QIcon, QWheelEvent
+    from PySide6.QtGui import QBrush, QColor, QFont, QDragEnterEvent, QDropEvent, QFocusEvent, QIcon, QWheelEvent
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -54,7 +54,7 @@ except ImportError as exc:
 
 
 APP_TITLE = "Folder Compare & Delete"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 APP_DEVELOPER = "Tonzdev"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 BG_COLOR = "#f4f7fb"
@@ -94,23 +94,40 @@ class MatchResult:
     same_name_different_content: List[FileRecord] = field(default_factory=list)
     missing_from_folders: List[str] = field(default_factory=list)
     only_in_target: bool = False
+    temp_synced_labels: List[str] = field(default_factory=list)
+    temp_synced_paths: List[str] = field(default_factory=list)
 
     @property
     def exact_folder_labels(self) -> str:
         labels = sorted({item.base_label for item in self.exact_matches})
+        if self.temp_synced_labels:
+            labels.extend(f"{lbl} (Disalin)" for lbl in self.temp_synced_labels)
         return ", ".join(labels) if labels else "-"
 
     @property
     def exact_paths_text(self) -> str:
-        if not self.exact_matches:
-            return "-"
-        return " | ".join(f"[{item.base_label}] {item.path}" for item in self.exact_matches)
+        parts = [f"[{item.base_label}] {item.path}" for item in self.exact_matches]
+        if self.temp_synced_paths:
+            parts.extend(f"(Baru) {p}" for p in self.temp_synced_paths)
+        return " | ".join(parts) if parts else "-"
 
     @property
     def diff_paths_text(self) -> str:
         if not self.same_name_different_content:
             return "-"
         return " | ".join(f"[{item.base_label}] {item.path}" for item in self.same_name_different_content)
+
+    @property
+    def missing_display_text(self) -> str:
+        if not self.missing_from_folders:
+            return "-"
+        display = []
+        for lbl in self.missing_from_folders:
+            if lbl in self.temp_synced_labels:
+                display.append(f"{lbl} (Disalin)")
+            else:
+                display.append(lbl)
+        return ", ".join(display)
 
     @property
     def status_text(self) -> str:
@@ -133,6 +150,7 @@ class MatchResult:
 class HistoryEntry:
     timestamp: str
     action: str
+    file_name: str
     status: str
     detail: str
     tone: str = "info"
@@ -229,7 +247,7 @@ class MatchResultTableModel(QAbstractTableModel):
             row.exact_folder_labels,
             row.exact_paths_text,
             row.diff_paths_text,
-            ", ".join(row.missing_from_folders) if row.missing_from_folders else "-",
+            row.missing_display_text,
             row.match_type,
         ]
         sort_values = [
@@ -240,7 +258,7 @@ class MatchResultTableModel(QAbstractTableModel):
             row.exact_folder_labels.lower(),
             row.exact_paths_text.lower(),
             row.diff_paths_text.lower(),
-            (", ".join(row.missing_from_folders) if row.missing_from_folders else "-").lower(),
+            row.missing_display_text.lower(),
             row.match_type.lower(),
         ]
 
@@ -253,7 +271,17 @@ class MatchResultTableModel(QAbstractTableModel):
         if role == Qt.BackgroundRole:
             return QBrush(self._result_background(row.tree_tag))
         if role == Qt.ForegroundRole:
+            if row.temp_synced_labels:
+                if index.column() in {4, 5}:
+                    return QBrush(QColor(PRIMARY))
+                elif index.column() == 7:
+                    return QBrush(QColor(RED))
             return QBrush(self._result_foreground(row.tree_tag))
+        if role == Qt.FontRole:
+            if row.temp_synced_labels and index.column() == 7:
+                font = QFont()
+                font.setBold(True)
+                return font
         if role == Qt.UserRole:
             return row
         if role == Qt.UserRole + 1:
@@ -349,7 +377,7 @@ class MatchResultFilterProxyModel(QSortFilterProxyModel):
 
 
 class HistoryTableModel(QAbstractTableModel):
-    HEADERS = ["Waktu", "Aksi", "Status", "Detail"]
+    HEADERS = ["Waktu", "Aksi", "Nama File", "Status", "Detail"]
 
     def __init__(self) -> None:
         super().__init__()
@@ -382,14 +410,14 @@ class HistoryTableModel(QAbstractTableModel):
             return None
 
         entry = self._rows[index.row()]
-        display_values = [entry.timestamp, entry.action, entry.status, entry.detail]
+        display_values = [entry.timestamp, entry.action, entry.file_name, entry.status, entry.detail]
 
         if role == Qt.DisplayRole:
             return display_values[index.column()]
         if role == Qt.ToolTipRole:
             return display_values[index.column()]
         if role == Qt.TextAlignmentRole:
-            return Qt.AlignVCenter | (Qt.AlignCenter if index.column() in {0, 2} else Qt.AlignLeft)
+            return Qt.AlignVCenter | (Qt.AlignCenter if index.column() in {0, 3} else Qt.AlignLeft)
         if role == Qt.BackgroundRole:
             return QBrush(self._tone_background(entry.tone))
         if role == Qt.ForegroundRole:
@@ -2033,11 +2061,670 @@ class FileDetailOverlayDialog(QDialog):
         parent = self.parentWidget()
         if parent is None:
             return
-        callback = getattr(parent, "copy_to_compare_folders" if operation == "copy" else "move_to_compare_folders", None)
-        if callback is None:
+        # Pass self._result explicitly instead of relying on current_selected_result
+        # which can be cleared by the focus-release handler when this dialog closes.
+        sync_fn = getattr(parent, "_sync_selected_result_to_compare_folders", None)
+        if sync_fn is None:
             return
         self.done(QDialog.Accepted)
-        QTimer.singleShot(180, callback)
+        QTimer.singleShot(180, lambda op=operation, r=self._result: sync_fn(op, explicit_result=r))
+
+
+class UpdateStatusDialog(QDialog):
+    def __init__(self, parent, latest_version: str, current_version: str, changelog: str, has_update: bool):
+        super().__init__(parent)
+        self._blur_target = parent.centralWidget() if isinstance(parent, QMainWindow) else parent
+        self._owns_blur_effect = False
+        self._is_finalizing = False
+        self._close_result = QDialog.Rejected
+        self._open_animation_started = False
+        self._blur_effect: Optional[QGraphicsBlurEffect] = None
+        self._processing = False
+
+        self.setModal(True)
+        self.setObjectName("UpdateStatusDialog")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMinimumSize(680, 480)
+        self.setWindowOpacity(0.0)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        overlay = QFrame()
+        self.overlay = overlay
+        overlay.setObjectName("OverlayBackdrop")
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.addStretch(1)
+
+        card = QFrame()
+        self.card = card
+        card.setObjectName("OverlayCard")
+        card.setMinimumWidth(560)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(16)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(14)
+        
+        icon_badge = QLabel("🎉" if has_update else "✨")
+        icon_badge.setObjectName("OverlayIcon")
+        icon_badge.setAlignment(Qt.AlignCenter)
+        icon_badge.setFixedSize(56, 56)
+
+        title_wrap = QVBoxLayout()
+        title_wrap.setSpacing(4)
+        
+        title_label = QLabel(f"Pembaruan Tersedia: v{latest_version}" if has_update else f"Aplikasi Terkini (v{current_version})")
+        title_label.setObjectName("OverlayTitle")
+        title_label.setWordWrap(True)
+
+        summary_label = QLabel(f"Versi saat ini v{current_version}. Pembaruan baru tersedia untuk diunduh." if has_update else "Anda sudah menggunakan aplikasi versi terbaru.")
+        summary_label.setObjectName("OverlaySummary")
+        summary_label.setWordWrap(True)
+
+        title_wrap.addWidget(title_label)
+        title_wrap.addWidget(summary_label)
+        header_row.addWidget(icon_badge, 0, Qt.AlignTop)
+        header_row.addLayout(title_wrap, 1)
+
+        card_layout.addLayout(header_row)
+
+        if changelog:
+            detail_label = QLabel("Catatan Rilis (Changelog)")
+            detail_label.setObjectName("OverlaySectionTitle")
+            card_layout.addWidget(detail_label)
+
+            from PySide6.QtWidgets import QTextBrowser
+            self.changelog_view = QTextBrowser()
+            self.changelog_view.setMarkdown(changelog)
+            self.changelog_view.setOpenExternalLinks(True)
+            self.changelog_view.setObjectName("OverlayDetails")
+            self.changelog_view.setMinimumHeight(180)
+            card_layout.addWidget(self.changelog_view, 1)
+        else:
+            card_layout.addStretch(1)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch(1)
+
+        if has_update:
+            self.btn_nanti = QPushButton("Nanti")
+            self.btn_nanti.setObjectName("OverlaySecondaryButton")
+            self.btn_nanti.clicked.connect(lambda: self.done(QDialog.Rejected))
+            
+            self.btn_unduh = QPushButton("Unduh Sekarang")
+            self.btn_unduh.setObjectName("OverlayPrimaryButton")
+            self.btn_unduh.clicked.connect(lambda: self.done(QDialog.Accepted))
+            
+            button_row.addWidget(self.btn_nanti)
+            button_row.addWidget(self.btn_unduh)
+        else:
+            self.btn_tutup = QPushButton("Tutup")
+            self.btn_tutup.setObjectName("OverlayPrimaryButton")
+            self.btn_tutup.clicked.connect(lambda: self.done(QDialog.Accepted))
+            button_row.addWidget(self.btn_tutup)
+
+        card_layout.addLayout(button_row)
+        overlay_layout.addWidget(card, 0, Qt.AlignCenter)
+        overlay_layout.addStretch(1)
+        outer.addWidget(overlay)
+
+        self._apply_stylesheet()
+
+    def _apply_stylesheet(self) -> None:
+        self.setStyleSheet(
+            f"""
+            QDialog#UpdateStatusDialog {{
+                background: transparent;
+            }}
+            QFrame#OverlayBackdrop {{
+                background: rgba(11, 18, 32, 168);
+                border-radius: 0px;
+            }}
+            QFrame#OverlayCard {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #ffffff,
+                    stop: 1 #f2f7ff
+                );
+                border: 1px solid #c7d8f9;
+                border-radius: 24px;
+            }}
+            QLabel#OverlayIcon {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #2b61df,
+                    stop: 1 #3f86ff
+                );
+                color: white;
+                border-radius: 28px;
+                font: 800 16pt "Segoe UI";
+            }}
+            QLabel#OverlayTitle {{
+                color: {TEXT};
+                font: 700 15pt "Segoe UI";
+            }}
+            QLabel#OverlaySummary {{
+                color: {MUTED};
+                font: 10pt "Segoe UI";
+                line-height: 1.4em;
+            }}
+            QLabel#OverlaySectionTitle {{
+                color: {TEXT};
+                font: 700 10pt "Segoe UI";
+            }}
+            QTextBrowser#OverlayDetails {{
+                background: #f8fbff;
+                color: #25324a;
+                border: 1px solid #dce5f6;
+                border-radius: 16px;
+                padding: 12px;
+                font: 9.5pt "Segoe UI";
+                selection-background-color: #dce8ff;
+            }}
+            QPushButton#OverlayPrimaryButton {{
+                min-width: 130px;
+                padding: 10px 18px;
+                border: none;
+                border-radius: 14px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #1f5eff,
+                    stop: 1 #3f86ff
+                );
+                color: white;
+                font: 700 10pt "Segoe UI";
+            }}
+            QPushButton#OverlayPrimaryButton:hover {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #174ce6,
+                    stop: 1 #2b61df
+                );
+            }}
+            QPushButton#OverlaySecondaryButton {{
+                min-width: 100px;
+                padding: 10px 18px;
+                border-radius: 14px;
+                border: 1px solid #c7d8f9;
+                background: white;
+                color: {TEXT};
+                font: 600 10pt "Segoe UI";
+            }}
+            QPushButton#OverlaySecondaryButton:hover {{
+                background: #f0f4fc;
+            }}
+            """
+        )
+
+    def showEvent(self, event) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.resize(parent.size())
+            self.move(parent.mapToGlobal(QPoint(0, 0)))
+        if getattr(self, "_blur_target", None) is not None and self._blur_target.graphicsEffect() is None:
+            from PySide6.QtWidgets import QGraphicsBlurEffect
+            blur = QGraphicsBlurEffect(self._blur_target)
+            blur.setBlurRadius(8.0)
+            self._blur_target.setGraphicsEffect(blur)
+            self._owns_blur_effect = True
+            self._blur_effect = blur
+        super().showEvent(event)
+        QTimer.singleShot(0, self._start_open_animation)
+
+    def done(self, result: int) -> None:
+        if self._processing:
+            return
+        if self._is_finalizing:
+            self._clear_blur()
+            super().done(result)
+            return
+        self._close_result = result
+        self._start_close_animation()
+
+    def hideEvent(self, event) -> None:
+        self._clear_blur()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if self._processing:
+            event.ignore()
+            return
+        if not self._is_finalizing:
+            event.ignore()
+            self.done(QDialog.Rejected)
+            return
+        self._clear_blur()
+        super().closeEvent(event)
+
+    def _clear_blur(self) -> None:
+        if self._owns_blur_effect and self._blur_target is not None:
+            self._blur_target.setGraphicsEffect(None)
+            self._owns_blur_effect = False
+        self._blur_effect = None
+
+    @staticmethod
+    def _scaled_rect(rect: QRect, scale: float) -> QRect:
+        width = max(1, int(rect.width() * scale))
+        height = max(1, int(rect.height() * scale))
+        center = rect.center()
+        scaled = QRect(0, 0, width, height)
+        scaled.moveCenter(center)
+        return scaled
+
+    def _start_open_animation(self) -> None:
+        if self._open_animation_started:
+            return
+        end_rect = self.card.geometry()
+        if not end_rect.isValid():
+            return
+        self._open_animation_started = True
+        start_rect = self._scaled_rect(end_rect, 0.985)
+        self.card.setGeometry(start_rect)
+        self.setWindowOpacity(0.0)
+        animation = QParallelAnimationGroup(self)
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(170)
+        opacity_animation.setStartValue(0.0)
+        opacity_animation.setEndValue(1.0)
+        opacity_animation.setEasingCurve(QEasingCurve.OutCubic)
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(180)
+        geometry_animation.setStartValue(start_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.start()
+        self._open_animation = animation
+
+    def _start_close_animation(self) -> None:
+        if self._is_finalizing:
+            return
+        current_rect = self.card.geometry()
+        if not current_rect.isValid():
+            self._finalize_close()
+            return
+        end_rect = self._scaled_rect(current_rect, 0.99)
+        animation = QParallelAnimationGroup(self)
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(140)
+        opacity_animation.setStartValue(self.windowOpacity())
+        opacity_animation.setEndValue(0.0)
+        opacity_animation.setEasingCurve(QEasingCurve.InCubic)
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(140)
+        geometry_animation.setStartValue(current_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.InCubic)
+        animation.finished.connect(self._finalize_close)
+        animation.start()
+        self._close_animation = animation
+
+    def _finalize_close(self) -> None:
+        if self._is_finalizing:
+            return
+        self._is_finalizing = True
+        try:
+            self._clear_blur()
+            super().done(self._close_result)
+        finally:
+            self._is_finalizing = False
+
+
+class UpdateDownloadDialog(QDialog):
+    def __init__(self, parent, target_version: str, download_url: str):
+        super().__init__(parent)
+        self._blur_target = parent.centralWidget() if isinstance(parent, QMainWindow) else parent
+        self._owns_blur_effect = False
+        self._is_finalizing = False
+        self._close_result = QDialog.Rejected
+        self._open_animation_started = False
+        self._blur_effect: Optional[QGraphicsBlurEffect] = None
+        self._processing = True
+
+        self.setModal(True)
+        self.setObjectName("UpdateDownloadDialog")
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMinimumSize(680, 480)
+        self.setWindowOpacity(0.0)
+        
+        self.target_version = target_version
+        self.download_url = download_url
+        self._is_cancelled = False
+        self.worker_thread = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        overlay = QFrame()
+        self.overlay = overlay
+        overlay.setObjectName("OverlayBackdrop")
+        overlay_layout = QVBoxLayout(overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.addStretch(1)
+
+        card = QFrame()
+        self.card = card
+        card.setObjectName("OverlayCard")
+        card.setMinimumWidth(560)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(20)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(14)
+        
+        icon_badge = QLabel("⬇️")
+        icon_badge.setObjectName("OverlayIcon")
+        icon_badge.setAlignment(Qt.AlignCenter)
+        icon_badge.setFixedSize(56, 56)
+
+        title_wrap = QVBoxLayout()
+        title_wrap.setSpacing(4)
+        self.title_label = QLabel(f"Mengunduh pembaruan v{self.target_version}...")
+        self.title_label.setObjectName("OverlayTitle")
+        
+        self.status_label = QLabel("Mempersiapkan unduhan...")
+        self.status_label.setObjectName("OverlaySummary")
+        self.status_label.setWordWrap(True)
+
+        title_wrap.addWidget(self.title_label)
+        title_wrap.addWidget(self.status_label)
+        header_row.addWidget(icon_badge, 0, Qt.AlignTop)
+        header_row.addLayout(title_wrap, 1)
+        card_layout.addLayout(header_row)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setObjectName("OverlayProgress")
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMinimumHeight(14)
+        card_layout.addWidget(self.progress_bar)
+
+        self.progress_text = QLabel("0%")
+        self.progress_text.setObjectName("OverlaySectionTitle")
+        self.progress_text.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(self.progress_text)
+        
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        button_row.addStretch(1)
+
+        self.cancel_button = QPushButton("Batalkan Unduhan")
+        self.cancel_button.setObjectName("OverlaySecondaryButton")
+        self.cancel_button.clicked.connect(self._cancel_download)
+        button_row.addWidget(self.cancel_button)
+
+        card_layout.addLayout(button_row)
+        overlay_layout.addWidget(card, 0, Qt.AlignCenter)
+        overlay_layout.addStretch(1)
+        outer.addWidget(overlay)
+
+        self._apply_stylesheet()
+
+    def _apply_stylesheet(self) -> None:
+        self.setStyleSheet(
+            f"""
+            QDialog#UpdateDownloadDialog {{
+                background: transparent;
+            }}
+            QFrame#OverlayBackdrop {{
+                background: rgba(11, 18, 32, 168);
+                border-radius: 0px;
+            }}
+            QFrame#OverlayCard {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #ffffff,
+                    stop: 1 #f2f7ff
+                );
+                border: 1px solid #c7d8f9;
+                border-radius: 24px;
+            }}
+            QLabel#OverlayIcon {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #2b61df,
+                    stop: 1 #3f86ff
+                );
+                color: white;
+                border-radius: 28px;
+                font: 800 18pt "Segoe UI";
+            }}
+            QLabel#OverlayTitle {{
+                color: {TEXT};
+                font: 700 15pt "Segoe UI";
+            }}
+            QLabel#OverlaySummary {{
+                color: {MUTED};
+                font: 10pt "Segoe UI";
+                line-height: 1.4em;
+            }}
+            QLabel#OverlaySectionTitle {{
+                color: {PRIMARY};
+                font: 800 11pt "Segoe UI";
+            }}
+            QProgressBar#OverlayProgress {{
+                background: #dce5f6;
+                border: none;
+                border-radius: 7px;
+            }}
+            QProgressBar#OverlayProgress::chunk {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 #2b61df, stop: 1 #3f86ff
+                );
+                border-radius: 7px;
+            }}
+            QPushButton#OverlaySecondaryButton {{
+                min-width: 140px;
+                padding: 10px 18px;
+                border-radius: 14px;
+                border: 1px solid #f4c2c2;
+                background: #fffafa;
+                color: #b52a42;
+                font: 600 10pt "Segoe UI";
+            }}
+            QPushButton#OverlaySecondaryButton:hover {{
+                background: #ffeeee;
+                border: 1px solid #eca1a1;
+            }}
+            QPushButton#OverlaySecondaryButton:disabled {{
+                background: #f0f4fc;
+                color: #9ab0d5;
+                border: 1px solid #dfe7f4;
+            }}
+            """
+        )
+
+    def showEvent(self, event) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.resize(parent.size())
+            self.move(parent.mapToGlobal(QPoint(0, 0)))
+        if getattr(self, "_blur_target", None) is not None and self._blur_target.graphicsEffect() is None:
+            from PySide6.QtWidgets import QGraphicsBlurEffect
+            blur = QGraphicsBlurEffect(self._blur_target)
+            blur.setBlurRadius(8.0)
+            self._blur_target.setGraphicsEffect(blur)
+            self._owns_blur_effect = True
+            self._blur_effect = blur
+        super().showEvent(event)
+        QTimer.singleShot(0, self._start_open_animation)
+
+    def done(self, result: int) -> None:
+        if getattr(self, "_is_finalizing", False):
+            self._clear_blur()
+            super().done(result)
+            return
+        self._close_result = result
+        self._start_close_animation()
+
+    def hideEvent(self, event) -> None:
+        self._clear_blur()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if self._processing and not self._is_cancelled:
+            event.ignore()
+            return
+        if not getattr(self, "_is_finalizing", False):
+            event.ignore()
+            self.done(QDialog.Rejected)
+            return
+        self._clear_blur()
+        super().closeEvent(event)
+
+    def _clear_blur(self) -> None:
+        if getattr(self, "_owns_blur_effect", False) and getattr(self, "_blur_target", None) is not None:
+            self._blur_target.setGraphicsEffect(None)
+            self._owns_blur_effect = False
+        self._blur_effect = None
+
+    @staticmethod
+    def _scaled_rect(rect: QRect, scale: float) -> QRect:
+        width = max(1, int(rect.width() * scale))
+        height = max(1, int(rect.height() * scale))
+        center = rect.center()
+        scaled = QRect(0, 0, width, height)
+        scaled.moveCenter(center)
+        return scaled
+
+    def _start_open_animation(self) -> None:
+        if getattr(self, "_open_animation_started", False):
+            return
+        end_rect = self.card.geometry()
+        if not end_rect.isValid():
+            return
+        self._open_animation_started = True
+        start_rect = self._scaled_rect(end_rect, 0.985)
+        self.card.setGeometry(start_rect)
+        self.setWindowOpacity(0.0)
+        animation = QParallelAnimationGroup(self)
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(170)
+        opacity_animation.setStartValue(0.0)
+        opacity_animation.setEndValue(1.0)
+        opacity_animation.setEasingCurve(QEasingCurve.OutCubic)
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(180)
+        geometry_animation.setStartValue(start_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.start()
+        self._open_animation = animation
+
+    def _start_close_animation(self) -> None:
+        if getattr(self, "_is_finalizing", False):
+            return
+        current_rect = self.card.geometry()
+        if not current_rect.isValid():
+            self._finalize_close()
+            return
+        end_rect = self._scaled_rect(current_rect, 0.99)
+        animation = QParallelAnimationGroup(self)
+        opacity_animation = QPropertyAnimation(self, b"windowOpacity", animation)
+        opacity_animation.setDuration(140)
+        opacity_animation.setStartValue(self.windowOpacity())
+        opacity_animation.setEndValue(0.0)
+        opacity_animation.setEasingCurve(QEasingCurve.InCubic)
+        geometry_animation = QPropertyAnimation(self.card, b"geometry", animation)
+        geometry_animation.setDuration(140)
+        geometry_animation.setStartValue(current_rect)
+        geometry_animation.setEndValue(end_rect)
+        geometry_animation.setEasingCurve(QEasingCurve.InCubic)
+        animation.finished.connect(self._finalize_close)
+        animation.start()
+        self._close_animation = animation
+
+    def _finalize_close(self) -> None:
+        if getattr(self, "_is_finalizing", False):
+            return
+        self._is_finalizing = True
+        try:
+            self._clear_blur()
+            super().done(self._close_result)
+        finally:
+            self._is_finalizing = False
+
+    def _cancel_download(self):
+        self._is_cancelled = True
+        self.status_label.setText("Membatalkan...")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Membatalkan...")
+        
+    def start_download(self):
+        import tempfile
+        import sys
+        
+        self.dest_path = os.path.join(tempfile.gettempdir(), f"update_v{self.target_version}_{uuid4().hex[:8]}")
+        is_exe = sys.executable.lower().endswith(f"{os.sep}folder_compare_delete_app.exe") or getattr(sys, 'frozen', False)
+        ext = ".exe" if is_exe else ".py"
+        if not self.dest_path.endswith(ext):
+            self.dest_path += ext
+            
+        def worker_func():
+            import urllib.request
+            try:
+                req = urllib.request.Request(self.download_url, headers={"User-Agent": "FolderCompareApp"})
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    total_size = int(response.getheader("Content-Length", 0) or 0)
+                    downloaded = 0
+                    with open(self.dest_path, "wb") as f:
+                        while not self._is_cancelled:
+                            chunk = response.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            pct = int((downloaded / total_size) * 100) if total_size > 0 else 0
+                            size_mb = f"{downloaded / 1024 / 1024:.1f} MB"
+                            total_mb = f"{total_size / 1024 / 1024:.1f} MB" if total_size > 0 else ""
+                            QTimer.singleShot(0, lambda d=pct, text=f"Terunduh: {size_mb} / {total_mb}": self._update_progress(d, text))
+                            
+                if not self._is_cancelled:
+                    QTimer.singleShot(0, lambda: self._finish_download(True))
+                else:
+                    QTimer.singleShot(0, lambda: self._finish_download(False))
+            except Exception as e:
+                QTimer.singleShot(0, lambda err=str(e): self._handle_error(err))
+
+        self.worker_thread = threading.Thread(target=worker_func, daemon=True)
+        self.worker_thread.start()
+
+    def _update_progress(self, percentage: int, text: str):
+        self.progress_bar.setValue(percentage)
+        self.progress_text.setText(f"{percentage}%")
+        self.status_label.setText(text)
+
+    def _handle_error(self, err: str):
+        self._processing = False
+        QMessageBox.warning(self, "Gagal", f"Gagal mengunduh pembaruan:\n\n{err}")
+        self.reject()
+
+    def _finish_download(self, success: bool):
+        self._processing = False
+        if not success:
+            if os.path.exists(self.dest_path):
+                try: os.remove(self.dest_path)
+                except: pass
+            self.reject()
+            return
+            
+        self.status_label.setText("Unduhan selesai. Mempersiapkan instalasi...")
+        self.progress_bar.setValue(100)
+        self.progress_text.setText("100%")
+        self.accept()
+
+    def get_downloaded_path(self) -> str:
+        return self.dest_path
 
 
 class ProcessingOverlayDialog(QDialog):
@@ -2256,6 +2943,11 @@ class FolderCompareDeleteApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        
+        icon_path = Path(__file__).parent / "assets" / "app_icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         self.resize(1560, 940)
         self.setMinimumSize(1280, 780)
 
@@ -2393,11 +3085,19 @@ class FolderCompareDeleteApp(QMainWindow):
         self.trash_nav_badge.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.trash_nav_badge.hide()
         self.trash_nav_badge.raise_()
+        
+        self.btn_nav_check_update = QPushButton()
+        self.btn_nav_check_update.setToolTip("Periksa Pembaruan")
+        self.btn_nav_check_update.setObjectName("SidebarButton")
+        self.btn_nav_check_update.setCursor(Qt.PointingHandCursor)
+        self.btn_nav_check_update.clicked.connect(self.check_for_updates)
+        self.btn_nav_check_update.setFixedSize(44, 44)
 
         layout.addWidget(self.btn_nav_dashboard, 0, Qt.AlignHCenter)
         layout.addWidget(self.btn_nav_history, 0, Qt.AlignHCenter)
         layout.addWidget(self.trash_nav_host, 0, Qt.AlignHCenter)
         layout.addStretch(1)
+        layout.addWidget(self.btn_nav_check_update, 0, Qt.AlignHCenter)
 
         dock_layout.addWidget(sidebar, 0, Qt.AlignHCenter)
         dock_layout.addStretch(1)
@@ -2498,7 +3198,49 @@ class FolderCompareDeleteApp(QMainWindow):
         self._refresh_widget_style(self.btn_nav_trash)
         self._apply_sidebar_icons(active_index=index)
 
-    def _update_trash_sidebar_badge(self) -> None:
+    def check_for_updates(self) -> None:
+        self.status_label.setText("Memeriksa pembaruan...")
+        self.btn_nav_check_update.setEnabled(False)
+
+        if not hasattr(self, "update_spinner_timer"):
+            self.update_spinner_timer = QTimer(self)
+            self.update_spinner_timer.timeout.connect(self._animate_update_icon)
+        self.update_angle = 0
+        from PySide6.QtGui import QIcon, QPixmap
+        icon_path = self._sidebar_icon_variant("sync.svg", "#ffffff")
+        self._update_original_pixmap = QIcon(str(icon_path)).pixmap(22, 22)
+        self.update_spinner_timer.start(50)
+
+        def worker():
+            import urllib.request
+            import json
+            try:
+                url = "https://api.github.com/repos/AlvinPradanaAntony/folder-compare-delete-vibecode/releases/latest"
+                req = urllib.request.Request(url, headers={"User-Agent": "FolderCompareApp"})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                    latest_version = data.get("tag_name", "").lstrip("v")
+                    release_url = data.get("html_url", "")
+                    changelog = data.get("body", "Tidak ada catatan rilis.")
+                    assets = data.get("assets", [])
+                    download_url = None
+                    for asset in assets:
+                        name = asset.get("name", "").lower()
+                        if name.endswith(".exe") or name.endswith(".py"):
+                            download_url = asset.get("browser_download_url")
+                            break
+                    
+                self.ui_queue.put(("update_check_done", {
+                    "latest_version": latest_version,
+                    "release_url": release_url,
+                    "download_url": download_url,
+                    "changelog": changelog,
+                    "current_version": APP_VERSION
+                }))
+            except Exception as e:
+                self.ui_queue.put(("update_check_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
         if not hasattr(self, "trash_nav_badge") or not hasattr(self, "btn_nav_trash"):
             return
 
@@ -2523,6 +3265,30 @@ class FolderCompareDeleteApp(QMainWindow):
         self.trash_nav_badge.show()
         self.trash_nav_badge.raise_()
         self.btn_nav_trash.setToolTip(f"Trash Internal ({count} file)")
+
+    def _animate_update_icon(self) -> None:
+        if not hasattr(self, "_update_original_pixmap"):
+            return
+        self.update_angle = (self.update_angle + 15) % 360
+        from PySide6.QtGui import QIcon, QPainter, QPixmap
+        from PySide6.QtCore import Qt
+        
+        size = self._update_original_pixmap.size()
+        rotated_pixmap = QPixmap(size)
+        rotated_pixmap.fill(Qt.transparent)
+        
+        painter = QPainter(rotated_pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        painter.translate(size.width() / 2, size.height() / 2)
+        painter.rotate(self.update_angle)
+        painter.translate(-size.width() / 2, -size.height() / 2)
+        
+        painter.drawPixmap(0, 0, self._update_original_pixmap)
+        painter.end()
+        
+        self.btn_nav_check_update.setIcon(QIcon(rotated_pixmap))
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -3346,7 +4112,7 @@ class FolderCompareDeleteApp(QMainWindow):
         self.history_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.history_table.setAlternatingRowColors(False)
-        self.history_table.setWordWrap(False)
+        self.history_table.setWordWrap(True)
         self.history_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.history_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.history_table.setTextElideMode(Qt.ElideRight)
@@ -3399,11 +4165,12 @@ class FolderCompareDeleteApp(QMainWindow):
             history_header.setSectionResizeMode(column, QHeaderView.Interactive)
 
         # Kolom detail dibuat fleksibel agar tabel selalu mengisi lebar parent.
-        history_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        history_header.setSectionResizeMode(4, QHeaderView.Stretch)
 
         self.history_table.setColumnWidth(0, 145)
-        self.history_table.setColumnWidth(1, 180)
-        self.history_table.setColumnWidth(2, 100)
+        self.history_table.setColumnWidth(1, 130)
+        self.history_table.setColumnWidth(2, 200)
+        self.history_table.setColumnWidth(3, 90)
 
     def _build_trash_page(self) -> QWidget:
         trash_card = QFrame()
@@ -3772,6 +4539,7 @@ class FolderCompareDeleteApp(QMainWindow):
             (self.btn_nav_dashboard, "dashboard.svg", active_index == 0),
             (self.btn_nav_history, "history.svg", active_index == 1),
             (self.btn_nav_trash, "trash-can.svg", active_index == 2),
+            (self.btn_nav_check_update, "sync.svg", False),
         ]
         for button, source_name, is_active in icon_specs:
             color = "#ffffff" if is_active else "#8ea0c3"
@@ -5148,6 +5916,62 @@ class FolderCompareDeleteApp(QMainWindow):
             QTimer.singleShot(0, self._finalize_undo_results)
             return
 
+        if kind == "update_check_error":
+            if hasattr(self, "update_spinner_timer"):
+                self.update_spinner_timer.stop()
+                self._apply_sidebar_icons(active_index=self.main_stack.currentIndex())
+            self.btn_nav_check_update.setEnabled(True)
+            self.status_label.setText("Gagal memeriksa pembaruan.")
+            QMessageBox.warning(self, "Pembaruan", f"Gagal mengecek pembaruan:\n\n{payload}")
+            return
+            
+        if kind == "update_check_done":
+            if hasattr(self, "update_spinner_timer"):
+                self.update_spinner_timer.stop()
+                self._apply_sidebar_icons(active_index=self.main_stack.currentIndex())
+            self.btn_nav_check_update.setEnabled(True)
+            data = payload
+            latest = data.get("latest_version")
+            current = data.get("current_version")
+            release_url = data.get("release_url")
+            download_url = data.get("download_url")
+            changelog = data.get("changelog")
+            
+            def parse_version(v):
+                return [int(x) if x.isdigit() else x for x in v.split('.')]
+                
+            try:
+                has_update = parse_version(latest) > parse_version(current)
+                if has_update:
+                    self.status_label.setText(f"Pembaruan tersedia: v{latest}")
+                else:
+                    self.status_label.setText("Aplikasi sudah versi terbaru.")
+
+                status_dialog = UpdateStatusDialog(self, latest, current, changelog, has_update)
+                if status_dialog.exec() == QDialog.DialogCode.Accepted and has_update:
+                    if download_url:
+                        dialog = UpdateDownloadDialog(self, latest, download_url)
+                        dialog.start_download()
+                        if dialog.exec() == QDialog.DialogCode.Accepted:
+                            downloaded_path = dialog.get_downloaded_path()
+                            import subprocess
+                            import sys
+                            try:
+                                if downloaded_path.endswith('.exe'):
+                                    subprocess.Popen([downloaded_path], shell=True)
+                                else:
+                                    subprocess.Popen([sys.executable, downloaded_path])
+                                sys.exit(0)
+                            except Exception as e:
+                                QMessageBox.critical(self, "Gagal", f"Gagal menjalankan pembaruan:\n\n{e}")
+                    else:
+                        import webbrowser
+                        webbrowser.open(release_url)
+                        self.status_label.setText("Membuka browser untuk mengunduh rilis terbaru...")
+            except Exception as e:
+                self.status_label.setText("Gagal memeriksa versi pembaruan.")
+            return
+
     def _on_progress_animation_finished(self) -> None:
         self._maybe_finalize_scan_after_progress()
 
@@ -5244,11 +6068,20 @@ class FolderCompareDeleteApp(QMainWindow):
         if self.result_rows and self.table_proxy.rowCount() > 0:
             QTimer.singleShot(40, self._finalize_table_layout_after_delete)
 
+        op_list = undo_payload.get("operations", []) if undo_payload else []
+        if len(op_list) == 1 and "destination" in op_list[0]:
+            target_path = op_list[0]["destination"]
+            success_details = f"File: {Path(target_path).name}\nPath: {target_path}\nSisa hasil terlihat: {remaining}"
+            warn_details = f"File: {Path(target_path).name}\nBerhasil: {deleted_count} | Gagal: {len(errors)}"
+        else:
+            success_details = f"Jumlah file diproses: {deleted_count}\nSisa hasil terlihat: {remaining}"
+            warn_details = f"Berhasil: {deleted_count} | Gagal: {len(errors)}"
+
         if errors:
             self._record_history(
                 "Penghapusan file",
                 "Sebagian gagal" if deleted_count > 0 else "Gagal",
-                f"Berhasil: {deleted_count} | Gagal: {len(errors)}",
+                warn_details,
                 "warning" if deleted_count > 0 else "error",
             )
             self._push_undo_action(undo_payload)
@@ -5266,11 +6099,10 @@ class FolderCompareDeleteApp(QMainWindow):
             )
         else:
             success_summary = f"Berhasil memproses {deleted_count} file dari Folder A."
-            success_details = f"Jumlah file diproses: {deleted_count}\nSisa hasil terlihat: {remaining}"
             self._record_history(
                 "Penghapusan file",
                 "Sukses",
-                f"Jumlah file diproses: {deleted_count} | Sisa hasil terlihat: {remaining}",
+                success_details,
                 "success",
             )
             self._push_undo_action(undo_payload)
@@ -5307,11 +6139,29 @@ class FolderCompareDeleteApp(QMainWindow):
 
         if operation in {"copy_compare_sync", "move_compare_sync"}:
             operation_label = "dipindahkan" if operation == "move_compare_sync" else "disalin"
+            source_path = str(payload_map.get("source_path", ""))
+            created_labels = payload_map.get("created_labels", [])
+            created_paths = payload_map.get("created_paths", [])
+            replaced_labels = payload_map.get("replaced_labels", [])
+            
             if processed_count > 0:
-                self.clear_results(reset_status=False)
+                if operation == "move_compare_sync":
+                    self.result_rows = [row for row in self.result_rows if str(row.target_path) != source_path]
+                else:
+                    for row in self.result_rows:
+                        if str(row.target_path) == source_path:
+                            row.temp_synced_labels.extend(created_labels + replaced_labels)
+                            row.temp_synced_paths.extend(created_paths)
+                            break
+                
                 self.status_label.setText(
-                    "Folder pembanding berubah. Hasil scan dibersihkan agar Anda dapat menjalankan scan ulang."
+                    f"File berhasil {operation_label}. Perubahan telah diterapkan pada tabel (tanpa perlu scan ulang)."
                 )
+                self._apply_default_table_widths()
+                self._populate_table(recompute_widths=False)
+                self._refresh_stats()
+                self._reset_detail_panel()
+
             if errors:
                 self._record_history(
                     "Sinkronisasi folder pembanding",
@@ -5458,8 +6308,8 @@ class FolderCompareDeleteApp(QMainWindow):
         self._remove_trash_entries(restored_trash_entry_ids)
         self._remove_trash_entries_from_undo_stack(restored_trash_entry_ids)
         self._cleanup_undo_action_dir(action_dir)
-        success_action = "Restore dari Trash" if label == "Pulihkan dari Trash Internal" else "Undo"
-        self._record_history(success_action, "Sukses", f"{label} | Operasi dipulihkan: {restored_count}", "success")
+        success_action = "Restore dari Trash" if label == "Pulihkan dari Trash Internal" else "Undo Berhasil"
+        self._record_history(success_action, "Sukses", f"Aksi: {label}\n{detail}\nOperasi dipulihkan: {restored_count}", "success")
         if label in {"Penghapusan file", "Sinkronisasi folder pembanding", "Pindah file terpilih", "Pulihkan dari Trash Internal"}:
             self.clear_results(reset_status=False)
             if label == "Pulihkan dari Trash Internal":
@@ -5504,12 +6354,28 @@ class FolderCompareDeleteApp(QMainWindow):
         normalized_lines = [line.strip() for line in str(detail).splitlines() if line.strip()]
         if not normalized_lines:
             return "-"
-        return " | ".join(normalized_lines)
+        return "\n".join(normalized_lines)
 
-    def _record_history(self, action: str, status: str, detail: str, tone: str = "info") -> None:
+    def _record_history(self, action: str, status: str, detail: str, tone: str = "info", file_name: str = "-") -> None:
+        if file_name == "-":
+            for line in str(detail).splitlines():
+                line = line.strip()
+                for keyword in ("Sumber: ", "File: ", "Path asli: ", "Tujuan: ", "Ke: ", "Path: "):
+                    if line.startswith(keyword):
+                        parts = line.split(": ", 1)
+                        if len(parts) == 2:
+                            val = parts[1].strip()
+                            extracted_name = Path(val).name
+                            if extracted_name:
+                                file_name = extracted_name
+                                break
+                if file_name != "-":
+                    break
+                    
         entry = HistoryEntry(
             timestamp=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             action=action,
+            file_name=file_name,
             status=status,
             detail=self._history_detail_text(detail),
             tone=tone,
@@ -5518,6 +6384,8 @@ class FolderCompareDeleteApp(QMainWindow):
         if len(self.history_entries) > self.history_limit:
             self.history_entries = self.history_entries[: self.history_limit]
         self.history_model.set_rows(self.history_entries)
+        if hasattr(self, "history_table"):
+            self.history_table.resizeRowsToContents()
         self._update_history_empty_state()
         self._refresh_history_summary()
 
@@ -5533,7 +6401,7 @@ class FolderCompareDeleteApp(QMainWindow):
         if hasattr(self, "history_issue_value"):
             self.history_issue_value.setText(str(issue_count))
         if hasattr(self, "history_undo_value"):
-            self.history_undo_value.setText("1 siap" if self.undo_stack else "0 siap")
+            self.history_undo_value.setText(f"{len(self.undo_stack)} siap")
         if hasattr(self, "history_summary_label"):
             if count:
                 latest_entry = self.history_entries[0]
@@ -5635,6 +6503,18 @@ class FolderCompareDeleteApp(QMainWindow):
         checkbox.setChecked(not checkbox.isChecked())
 
     def _update_trash_selection_state(self) -> None:
+        selected_count = len(self._selected_trash_entry_ids()) if hasattr(self, "trash_table") else 0
+        has_entries = bool(self.trash_entries)
+        if hasattr(self, "trash_selection_value"):
+            self.trash_selection_value.setText(f"{selected_count} dipilih")
+        if hasattr(self, "trash_restore_selected_button"):
+            self.trash_restore_selected_button.setEnabled(selected_count > 0)
+        if hasattr(self, "trash_delete_selected_button"):
+            self.trash_delete_selected_button.setEnabled(selected_count > 0)
+        if hasattr(self, "trash_delete_all_button"):
+            self.trash_delete_all_button.setEnabled(has_entries)
+
+    def _update_trash_sidebar_badge(self) -> None:
         selected_count = len(self._selected_trash_entry_ids()) if hasattr(self, "trash_table") else 0
         has_entries = bool(self.trash_entries)
         if hasattr(self, "trash_selection_value"):
@@ -5810,9 +6690,14 @@ class FolderCompareDeleteApp(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "Undo sebelumnya masih berjalan.")
             return
 
+        if len(selected_entries) == 1:
+            action_detail = f"File: {Path(selected_entries[0].trash_path).name}\nKe: {selected_entries[0].original_path}"
+        else:
+            action_detail = f"Jumlah file: {len(selected_entries)}"
+
         undo_action = UndoAction(
             label="Pulihkan dari Trash Internal",
-            detail=f"Jumlah file: {len(selected_entries)}",
+            detail=action_detail,
             operations=[
                 self._serialize_undo_operation(
                     "move_path",
@@ -5825,7 +6710,7 @@ class FolderCompareDeleteApp(QMainWindow):
         )
 
         self.status_label.setText(f"Memulihkan {len(selected_entries)} file dari trash internal...")
-        self._record_history("Restore dari Trash", "Diproses", f"Jumlah file: {len(selected_entries)}", "info")
+        self._record_history("Restore dari Trash", "Diproses", action_detail, "info")
         self._set_undo_processing_state(True)
         self.undo_button.setEnabled(False)
         dialog = ProcessingOverlayDialog(
@@ -5873,10 +6758,18 @@ class FolderCompareDeleteApp(QMainWindow):
 
         self._remove_trash_entries(entry_ids)
         self._remove_trash_entries_from_undo_stack(entry_ids)
+        
+        entry_list = [self._find_trash_entry(eid) for eid in entry_ids]
+        entry_list = [e for e in entry_list if e is not None]
+        if len(entry_list) == 1:
+            single_val = f"File: {Path(entry_list[0].trash_path).name}\nPath asli: {entry_list[0].original_path}\n"
+        else:
+            single_val = ""
+            
         self._record_history(
             "Hapus permanen dari Trash",
             "Sebagian gagal" if errors and deleted_count > 0 else "Sukses" if not errors else "Gagal",
-            f"Berhasil: {deleted_count} | Gagal: {len(errors)}",
+            f"{single_val}Berhasil: {deleted_count} | Gagal: {len(errors)}",
             "warning" if errors else "success",
         )
         if errors:
@@ -5943,7 +6836,7 @@ class FolderCompareDeleteApp(QMainWindow):
         while len(self.undo_stack) > self.undo_limit:
             discarded = self.undo_stack.pop(0)
             self._cleanup_undo_action_dir(discarded.action_dir)
-        self._refresh_undo_button()
+        self._refresh_history_summary()
 
     @staticmethod
     def _serialize_undo_operation(kind: str, **kwargs: str) -> Dict[str, str]:
@@ -5976,9 +6869,9 @@ class FolderCompareDeleteApp(QMainWindow):
             return
 
         action = self.undo_stack.pop()
-        self._refresh_undo_button()
+        self._refresh_history_summary()
         self.status_label.setText(f"Menjalankan undo untuk aksi: {action.label}...")
-        self._record_history("Undo", "Diproses", action.label, "info")
+        self._record_history("Undo", "Diproses", f"Aksi: {action.label}\n{action.detail}", "info")
         self._set_undo_processing_state(True)
         self.undo_button.setEnabled(False)
 
@@ -6219,13 +7112,12 @@ class FolderCompareDeleteApp(QMainWindow):
             return
 
         self.current_selected_result = result
-        actual_missing_labels = self._actual_missing_compare_labels(result)
         self.detail_labels["status"].setText(result.status_text)
         self.detail_labels["target"].setText(str(result.target_path))
         self.detail_labels["relative"].setText(result.target_relative_path)
         self.detail_labels["size"].setText(f"{self._format_size(result.size)} ({result.size} bytes)")
         self.detail_labels["found"].setText(result.exact_folder_labels)
-        self.detail_labels["missing"].setText(", ".join(actual_missing_labels) if actual_missing_labels else "-")
+        self.detail_labels["missing"].setText(result.missing_display_text)
         self.detail_labels["mode"].setText(result.match_type)
         self.detail_labels["exact"].setText(result.exact_paths_text)
         self.detail_labels["diff"].setText(result.diff_paths_text)
@@ -6348,11 +7240,18 @@ class FolderCompareDeleteApp(QMainWindow):
             index = int(label[1:]) - 1
         except ValueError:
             return None
-        if not (0 <= index < len(self.compare_folder_rows)):
+        # Labels F1, F2, … are assigned during scan by enumerating only the
+        # *non-empty* compare-folder rows (same as in start_scan). We must
+        # apply the same filter here so that an empty row in the middle does
+        # not cause the label to resolve to the wrong (or missing) folder.
+        filled_paths = [
+            self._normalize_folder_path(row["edit"].text())
+            for row in self.compare_folder_rows
+            if self._normalize_folder_path(row["edit"].text())
+        ]
+        if not (0 <= index < len(filled_paths)):
             return None
-        raw_path = self._normalize_folder_path(self.compare_folder_rows[index]["edit"].text())
-        if not raw_path:
-            return None
+        raw_path = filled_paths[index]
         path = Path(raw_path)
         return path if path.exists() and path.is_dir() else None
 
@@ -6416,8 +7315,8 @@ class FolderCompareDeleteApp(QMainWindow):
     def move_to_compare_folders(self) -> None:
         self._sync_selected_result_to_compare_folders("move")
 
-    def _sync_selected_result_to_compare_folders(self, operation: str) -> None:
-        result = self.current_selected_result
+    def _sync_selected_result_to_compare_folders(self, operation: str, explicit_result: Optional["MatchResult"] = None) -> None:
+        result = explicit_result if explicit_result is not None else self.current_selected_result
         if result is None:
             QMessageBox.information(self, APP_TITLE, "Pilih satu item terlebih dahulu.")
             return
@@ -6625,7 +7524,9 @@ class FolderCompareDeleteApp(QMainWindow):
                     "error_count": len(errors),
                     "destination_root": ", ".join(create_labels + replace_labels),
                     "relative_path": relative_path,
+                    "source_path": source_path,
                     "created_labels": create_labels,
+                    "created_paths": create_paths,
                     "replaced_labels": replace_labels,
                     "errors": errors,
                     "undo_action": undo_payload,
@@ -7005,14 +7906,21 @@ class FolderCompareDeleteApp(QMainWindow):
         dialog.set_processing(True, f"Sedang memproses {len(paths)} file dari Folder A. Mohon tunggu...")
         self._set_delete_processing_state(True)
         dialog.flush_visual_state()
+
+        use_internal_trash = self._current_delete_mode() == "internal_trash"
+        trash_text = "Trash Internal" if use_internal_trash else "Permanen"
+        if len(paths) == 1:
+            detail_msg = f"File: {Path(paths[0]).name}\nPath: {paths[0]}\nMode: {trash_text}"
+        else:
+            detail_msg = f"Jumlah file: {len(paths)}\nMode: {trash_text}"
+
         self._record_history(
             "Penghapusan file",
             "Diproses",
-            f"Jumlah file: {len(paths)}\nMode: {'Trash Internal' if self._current_delete_mode() == 'internal_trash' else 'Permanen'}",
+            detail_msg,
             "warning",
         )
 
-        use_internal_trash = self._current_delete_mode() == "internal_trash"
         QTimer.singleShot(
             0,
             lambda delete_paths=list(paths), trash_mode=use_internal_trash: self._launch_delete_worker(
@@ -7305,6 +8213,14 @@ def _handle_thread_exception(args: threading.ExceptHookArgs) -> None:
 
 
 def main() -> int:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            myappid = f'tonzdev.foldercomparedeleteapp.{APP_VERSION}'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
     sys.excepthook = _handle_uncaught_exception
     threading.excepthook = _handle_thread_exception
 
