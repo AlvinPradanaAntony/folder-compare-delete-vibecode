@@ -2,6 +2,17 @@
 
 Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
+## [2.4.0] - 2026-04-09
+
+### Ditambahkan
+- Fitur **Bulk Sync (Sinkronisasi Massal)** pada file duplikat (hijau) yang mising atau kurang di direktori target, menyalin secara instan ke seluruh folder pembanding tanpa proses scan ulang.
+- Tombol konteks **Tampilkan di File Explorer** untuk mengakses file asli pada sistem operasi dengan cepat.
+- Implementasi baru indikator visual loading menggunakan **PyQt WaitingSpinner** demi antarmuka pengguna yang jauh lebih halus.
+
+### Diperbarui
+- Konteks rekaman di *Undo Stack* dan *History* kini dioptimalkan lebih spesifik dengan melacak riwayat *affected file names*.
+- Perbaikan rilis GitHub Actions (CI/CD) mendukung injeksi direktori aset dan folder komponen eksternal.
+
 ## [2.3.0] - 2026-04-07
 
 ### Ditambahkan
@@ -13,6 +24,11 @@ Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 ### Diperbarui
 - Penyesuaian pada kolom riwayat/history `("Nama File")` untuk menampilkan detail yang lebih kontekstual pada nama file.
 - Penyelesaian masalah status sinkronisasi tabel (label yang tersalin/terpindah) sehingga tak lagi memerlukan scan manual berulang kali.
+
+<details>
+<summary><strong>Lihat Riwayat Versi Sebelumnya</strong></summary>
+
+<br>
 
 ## [2.2.0] - 2026-04-04
 
@@ -72,3 +88,5 @@ Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 ### Diperbarui
 
 - Pengoptimasian kode dan penyesuaian GUI agar dapat dijalankan di Windows, macOS, dan Linux.
+
+</details>
