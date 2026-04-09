@@ -57,7 +57,7 @@ except ImportError as exc:
 
 
 APP_TITLE = "Folder Compare & Delete"
-APP_VERSION = "2.4.3"
+APP_VERSION = "2.4.4"
 APP_DEVELOPER = "Tonzdev"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 BG_COLOR = "#f4f7fb"
@@ -2081,7 +2081,7 @@ class FileDetailOverlayDialog(QDialog):
             else:  # linux
                 subprocess.Popen(['xdg-open', os.path.dirname(path)])
         except Exception as e:
-            QMessageBox.warning(self, "Gagal Membuka File", f"Tidak dapat membuka file explorer:\n\n{str(e)}")
+            self.show_error_dialog("Peringatan", f"Tidak dapat membuka file explorer:\n\n{str(e)}", "")
 
     def _trigger_compare_action(self, operation: str) -> None:
         parent = self.parentWidget()
@@ -2839,7 +2839,7 @@ class UpdateDownloadDialog(QDialog):
 
     def _handle_error(self, err: str):
         self._processing = False
-        QMessageBox.warning(self, "Gagal", f"Gagal mengunduh pembaruan:\n\n{err}")
+        self.show_error_dialog("Peringatan", f"Gagal mengunduh pembaruan:\n\n{err}", "")
         self.reject()
 
     def _finish_download(self, success: bool):
@@ -5548,7 +5548,7 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def remove_compare_folder_row(self) -> None:
         if len(self.compare_folder_rows) <= 1:
-            QMessageBox.information(self, APP_TITLE, "Minimal harus ada satu folder pembanding.")
+            self.show_error_dialog("Info", "Minimal harus ada satu folder pembanding.", "")
             return
 
         last = self.compare_folder_rows.pop()
@@ -5568,7 +5568,7 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def start_scan(self) -> None:
         if self.scan_thread and self.scan_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Proses scan masih berjalan.")
+            self.show_error_dialog("Info", "Proses scan masih berjalan.", "")
             return
 
         target_folder = self._normalize_folder_path(self.target_folder_edit.text())
@@ -5585,13 +5585,13 @@ class FolderCompareDeleteApp(QMainWindow):
                 row["edit"].setText(normalized)
 
         if not target_folder:
-            QMessageBox.warning(self, APP_TITLE, "Folder A wajib diisi.")
+            self.show_error_dialog("Peringatan", "Folder A wajib diisi.", "")
             return
         if not compare_folders:
-            QMessageBox.warning(self, APP_TITLE, "Minimal isi satu folder pembanding.")
+            self.show_error_dialog("Peringatan", "Minimal isi satu folder pembanding.", "")
             return
         if any(Path(target_folder) == Path(folder) for folder in compare_folders):
-            QMessageBox.warning(self, APP_TITLE, "Folder A tidak boleh sama dengan folder pembanding.")
+            self.show_error_dialog("Peringatan", "Folder A tidak boleh sama dengan folder pembanding.", "")
             return
 
         self.clear_results(reset_status=False)
@@ -6140,7 +6140,7 @@ class FolderCompareDeleteApp(QMainWindow):
                 self._apply_sidebar_icons(active_index=self.main_stack.currentIndex())
             self.btn_nav_check_update.setEnabled(True)
             self.status_label.setText("Gagal memeriksa pembaruan.")
-            QMessageBox.warning(self, "Pembaruan", f"Gagal mengecek pembaruan:\n\n{payload}")
+            self.show_error_dialog("Peringatan", f"Gagal mengecek pembaruan:\n\n{payload}", "")
             return
             
         if kind == "update_check_done":
@@ -6197,8 +6197,8 @@ class FolderCompareDeleteApp(QMainWindow):
                                 
                                 is_archive = lower_path.endswith(('.zip', '.tar.gz', '.tgz', '.rar'))
                                 if is_archive:
-                                    QMessageBox.information(
-                                        self, 
+                                    self.show_error_dialog(
+                                        "Info", 
                                         "Pembaruan Manual Diperlukan", 
                                         f"File unduhan merupakan arsip ({os.path.basename(downloaded_path)}).\n\nSilakan ekstrak file ini dan ganti file aplikasi lama Anda secara manual."
                                     )
@@ -6246,10 +6246,8 @@ class FolderCompareDeleteApp(QMainWindow):
                                         target_path = sys.executable if is_frozen else os.path.abspath(sys.argv[0])
                                     
                                     # Hapus environment variable yg berhubungan dgn PyInstaller agar app baru tidak error DLL
-                                    env = os.environ.copy()
-                                    env.pop("_MEIPASS", None)
-                                    env.pop("_MEIPASS2", None)
-                                    env.pop("_PYIBoot_SPLASH", None)
+                                    # Dictionary comprehension agar _MEIPASS terhapus tanpa peduli case-sensitive (huruf besar/kecil)
+                                    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("_MEI", "_PYI"))}
 
                                     if system == "windows":
                                         bat_path = os.path.join(tempfile.gettempdir(), "updater.bat")
@@ -6257,8 +6255,11 @@ class FolderCompareDeleteApp(QMainWindow):
                                             f.write('@echo off\n')
                                             f.write('set _MEIPASS=\n')
                                             f.write('set _MEIPASS2=\n')
-                                            f.write('timeout /t 2 /nobreak > NUL\n')
+                                            f.write('set _PYIBoot_SPLASH=\n')
+                                            f.write(':retry\n')
+                                            f.write('timeout /t 1 /nobreak > NUL\n')
                                             f.write(f'move /Y "{downloaded_path}" "{target_path}"\n')
+                                            f.write('if errorlevel 1 goto retry\n')
                                             if is_frozen:
                                                 f.write(f'start "" "{target_path}"\n')
                                             else:
@@ -6269,18 +6270,16 @@ class FolderCompareDeleteApp(QMainWindow):
                                         sh_path = os.path.join(tempfile.gettempdir(), "updater.sh")
                                         with open(sh_path, "w") as f:
                                             f.write('#!/bin/bash\n')
-                                            f.write('unset _MEIPASS _MEIPASS2 _PYIBoot_SPLASH\n')
-                                            f.write('sleep 2\n')
+                                            f.write('for var in $(compgen -v | grep -E "^_MEI|^_PYI"); do unset "$var"; done\n')
+                                            
+                                            f.write(f'while true; do mv -f "{downloaded_path}" "{target_path}" && break; sleep 1; done\n')
+                                            f.write(f'chmod +x "{target_path}"\n')
                                             
                                             if system == "darwin" and target_path.endswith("/MacOS/FolderCompare"):
-                                                # Overwrite seluruh .app bundle di parent folder jika Mac OS App Bundle
+                                                # Jalankan via OSX open command tapi kita modifikasi isinya dengan single binary pengganti
                                                 bundle_path = os.path.abspath(os.path.join(target_path, "../../.."))
-                                                f.write(f'mv -f "{downloaded_path}" "{bundle_path}"\n')
-                                                f.write(f'chmod -R +x "{bundle_path}"\n')
                                                 f.write(f'nohup open "{bundle_path}" >/dev/null 2>&1 &\n')
                                             else:
-                                                f.write(f'mv -f "{downloaded_path}" "{target_path}"\n')
-                                                f.write(f'chmod +x "{target_path}"\n')
                                                 if is_frozen:
                                                     f.write(f'nohup "{target_path}" >/dev/null 2>&1 &\n')
                                                 else:
@@ -6290,7 +6289,7 @@ class FolderCompareDeleteApp(QMainWindow):
                                         subprocess.Popen([sh_path], shell=False, start_new_session=True, env=env)
                                     sys.exit(0)
                             except Exception as e:
-                                QMessageBox.critical(self, "Gagal", f"Gagal menjalankan pembaruan:\n\n{e}")
+                                self.show_error_dialog("Error", f"Gagal menjalankan pembaruan:\n\n{e}", "")
                     else:
                         import webbrowser
                         webbrowser.open(release_url)
@@ -6349,10 +6348,10 @@ class FolderCompareDeleteApp(QMainWindow):
             self._update_delete_action_controls()
         else:
             self._update_delete_action_controls()
-            QMessageBox.information(
-                self,
-                APP_TITLE,
-                "Tidak ada hasil yang sesuai dengan izin hapus saat ini. Aktifkan opsi merah/oranye bila memang ingin menghapus kategori tersebut.",
+            self.show_error_dialog(
+                "Info",
+                "Tidak ada hasil yang sesuai dengan izin hapus.",
+                "Aktifkan opsi merah/oranye bila memang ingin menghapus kategori tersebut."
             )
 
         QTimer.singleShot(40, self._finalize_table_layout_after_scan)
@@ -6755,7 +6754,7 @@ class FolderCompareDeleteApp(QMainWindow):
             dialog = ErrorOverlayDialog(self, title, summary, details)
             dialog.exec()
         except Exception:
-            QMessageBox.critical(self, title or APP_TITLE, summary or "Terjadi kesalahan pada aplikasi.")
+            self.show_error_dialog("Error", summary or "Terjadi kesalahan pada aplikasi.", "")
 
     def show_success_dialog(self, title: str, summary: str, details: str = "") -> None:
         self.status_label.setText(summary or "Aksi berhasil diproses.")
@@ -6763,7 +6762,7 @@ class FolderCompareDeleteApp(QMainWindow):
             dialog = SuccessOverlayDialog(self, title, summary, details)
             dialog.exec()
         except Exception:
-            QMessageBox.information(self, title or APP_TITLE, summary or "Aksi berhasil diproses.")
+            self.show_error_dialog("Info", summary or "Aksi berhasil diproses.", "")
 
     def _history_detail_text(self, detail: str) -> str:
         normalized_lines = [line.strip() for line in str(detail).splitlines() if line.strip()]
@@ -7318,19 +7317,19 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def undo_last_action(self) -> None:
         if self.scan_thread and self.scan_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses scan selesai sebelum menjalankan undo.")
+            self.show_error_dialog("Info", "Tunggu sampai proses scan selesai sebelum menjalankan undo.", "")
             return
         if self.delete_thread and self.delete_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses penghapusan selesai sebelum menjalankan undo.")
+            self.show_error_dialog("Info", "Tunggu sampai proses penghapusan selesai sebelum menjalankan undo.", "")
             return
         if self.transfer_thread and self.transfer_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Tunggu sampai proses salin/pindah selesai sebelum menjalankan undo.")
+            self.show_error_dialog("Info", "Tunggu sampai proses salin/pindah selesai sebelum menjalankan undo.", "")
             return
         if self.undo_thread and self.undo_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Undo aksi sebelumnya masih berjalan.")
+            self.show_error_dialog("Info", "Undo aksi sebelumnya masih berjalan.", "")
             return
         if not self.undo_stack:
-            QMessageBox.information(self, APP_TITLE, "Belum ada aksi yang bisa di-undo.")
+            self.show_error_dialog("Info", "Belum ada aksi yang bisa di-undo.", "")
             return
 
         action = self.undo_stack.pop()
@@ -7668,7 +7667,7 @@ class FolderCompareDeleteApp(QMainWindow):
             else:  # linux
                 subprocess.Popen(['xdg-open', os.path.dirname(path)])
         except Exception as e:
-            QMessageBox.warning(self, "Gagal Membuka File", f"Tidak dapat membuka file explorer:\n\n{str(e)}")
+            self.show_error_dialog("Peringatan", f"Tidak dapat membuka file explorer:\n\n{str(e)}", "")
 
     def _open_detail_dialog_from_index(self, index: QModelIndex) -> None:
         if not index.isValid():
@@ -7718,7 +7717,7 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def copy_selected_path(self) -> None:
         if self.current_selected_result is None:
-            QMessageBox.information(self, APP_TITLE, "Pilih satu item terlebih dahulu.")
+            self.show_error_dialog("Info", "Pilih satu item terlebih dahulu.", "")
             return
 
         QApplication.clipboard().setText(str(self.current_selected_result.target_path))
@@ -7840,10 +7839,10 @@ class FolderCompareDeleteApp(QMainWindow):
     def _sync_selected_result_to_compare_folders(self, operation: str, explicit_result: Optional["MatchResult"] = None) -> None:
         result = explicit_result if explicit_result is not None else self.current_selected_result
         if result is None:
-            QMessageBox.information(self, APP_TITLE, "Pilih satu item terlebih dahulu.")
+            self.show_error_dialog("Info", "Pilih satu item terlebih dahulu.", "")
             return
         if self.transfer_thread and self.transfer_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Proses salin/pindah file lain masih berjalan.")
+            self.show_error_dialog("Info", "Proses salin/pindah file lain masih berjalan.", "")
             return
 
         plan = self._compare_sync_plan(result)
@@ -7854,10 +7853,10 @@ class FolderCompareDeleteApp(QMainWindow):
         source = str(plan["source"] or "")
 
         if not source or (not create_paths and not replace_paths):
-            QMessageBox.information(
-                self,
-                APP_TITLE,
+            self.show_error_dialog(
+                "Peringatan",
                 "Tidak ada folder pembanding yang relevan untuk aksi ini.",
+                "Silakan cek kembali pengaturan folder pembanding Anda."
             )
             self._refresh_missing_compare_suggestion(result)
             return
@@ -8302,10 +8301,10 @@ class FolderCompareDeleteApp(QMainWindow):
                 if result and result.tree_tag == "exact_match" and self._actual_missing_compare_labels(result):
                     results_to_sync.append(result)
             if not results_to_sync:
-                QMessageBox.information(
-                    self, 
-                    APP_TITLE, 
-                    "Pilihan Anda tidak memiliki baris data duplikat (hijau) yang mising folder pembanding."
+                self.show_error_dialog(
+                    "Peringatan",
+                    "Pilihan Anda tidak memiliki data duplikat yang berkaitan dengan folder pembanding.",
+                    "Pilih baris berlabel hijau yang kosong pada sebagian kolom pembanding."
                 )
                 return
         else:
@@ -8314,18 +8313,21 @@ class FolderCompareDeleteApp(QMainWindow):
                     results_to_sync.append(result)
             
             if not results_to_sync:
-                QMessageBox.information(
-                    self, 
-                    APP_TITLE, 
-                    "Tidak ada data hijau (duplikat) yang memiliki file mising untuk disinkronkan."
+                self.show_error_dialog(
+                    "Info",
+                    "Tidak ada data duplikat yang memiliki file kosong di tujuan.",
+                    "Semua sinkronisasi hijau sudah terpenuhi."
                 )
                 return
             
-            if QMessageBox.question(
-                self, 
-                "Sync Semua Hijau Missing", 
+            confirm_dialog = ConfirmOverlayDialog(
+                self,
+                "Sync Semua Hijau Missing",
                 f"Anda tidak sedang memilih baris. Sinkronkan semua {len(results_to_sync)} data duplikat yang mising tersebut ke folder pembanding masing-masing?",
-            ) != QMessageBox.StandardButton.Yes:
+                "Proses otomatis ke folder pembanding yang masih belum memiliki baris data (hijau).",
+            )
+            confirm_dialog.confirmRequested.connect(confirm_dialog.accept)
+            if confirm_dialog.exec() != QDialog.Accepted:
                 return
 
         total_files = 0
@@ -8337,7 +8339,7 @@ class FolderCompareDeleteApp(QMainWindow):
             destinations_set.update(plan["create_labels"])
 
         if total_files == 0:
-            QMessageBox.information(self, APP_TITLE, "Folder pembanding yang tertuju kemungkinan belum disetel.")
+            self.show_error_dialog("Info", "Folder pembanding yang tertuju kemungkinan belum disetel.", "")
             return
 
         dest_str = ", ".join(sorted(destinations_set))
@@ -8537,7 +8539,7 @@ class FolderCompareDeleteApp(QMainWindow):
     def delete_selected(self) -> None:
         selected_rows = sorted({index.row() for index in self.results_table.selectionModel().selectedRows()})
         if not selected_rows:
-            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari hasil scan.")
+            self.show_error_dialog("Info", "Pilih minimal satu file dari hasil scan.", "")
             return
 
         deletable_results: List[MatchResult] = []
@@ -8552,10 +8554,10 @@ class FolderCompareDeleteApp(QMainWindow):
                 skipped_counts[result.tree_tag] = skipped_counts.get(result.tree_tag, 0) + 1
 
         if not deletable_results:
-            QMessageBox.information(
-                self,
-                APP_TITLE,
-                "Pilihan Anda belum termasuk kategori yang diizinkan untuk dihapus. Aktifkan opsi merah/oranye jika memang diperlukan.",
+            self.show_error_dialog(
+                "Pilihan Diabaikan",
+                "Pilihan Anda belum termasuk kategori yang diizinkan untuk dihapus.",
+                "Aktifkan opsi merah/oranye jika memang Anda yakin untuk memproses file pada kategori tersebut."
             )
             return
         skipped_messages: List[str] = []
@@ -8568,24 +8570,24 @@ class FolderCompareDeleteApp(QMainWindow):
                 f"{skipped_counts['only_target']} item oranye diabaikan karena izin hapus oranye belum aktif."
             )
         if skipped_messages:
-            QMessageBox.information(self, APP_TITLE, " ".join(skipped_messages))
+            self.show_error_dialog("Info", " ".join(skipped_messages, ""))
 
         self._confirm_and_delete(deletable_results)
 
     def delete_all_results(self) -> None:
         deletable_results = self._deletable_results()
         if not deletable_results:
-            QMessageBox.information(
-                self,
-                APP_TITLE,
+            self.show_error_dialog(
+                "Info",
                 "Belum ada hasil yang sesuai dengan izin hapus saat ini.",
+                "Ubah opsi cek box hapus pada bagian kontrol atas."
             )
             return
         self._confirm_and_delete(deletable_results)
 
     def _confirm_and_delete(self, results: List[MatchResult]) -> None:
         if self.delete_thread and self.delete_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Proses penghapusan masih berjalan.")
+            self.show_error_dialog("Info", "Proses penghapusan masih berjalan.", "")
             return
 
         delete_paths = [result.target_path for result in results]
@@ -8751,7 +8753,7 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def export_csv(self) -> None:
         if not self.result_rows:
-            QMessageBox.information(self, APP_TITLE, "Belum ada hasil scan untuk disimpan.")
+            self.show_error_dialog("Info", "Belum ada hasil scan untuk disimpan.", "")
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
@@ -8821,14 +8823,14 @@ class FolderCompareDeleteApp(QMainWindow):
 
         self._push_undo_action(undo_payload)
         self._record_history("Export CSV", "Sukses", save_path, "success")
-        QMessageBox.information(self, APP_TITLE, f"Berhasil menyimpan CSV:\n{save_path}")
+        self.show_error_dialog("Info", f"Berhasil menyimpan CSV:\n{save_path}", "")
 
     def export_excel(self) -> None:
         if not self.result_rows:
-            QMessageBox.information(self, APP_TITLE, "Belum ada hasil scan untuk disimpan.")
+            self.show_error_dialog("Info", "Belum ada hasil scan untuk disimpan.", "")
             return
         if not self.openpyxl_available:
-            QMessageBox.warning(self, APP_TITLE, "Modul openpyxl belum terpasang. Jalankan: pip install openpyxl")
+            self.show_error_dialog("Peringatan", "Modul openpyxl belum terpasang. Jalankan: pip install openpyxl", "")
             return
 
         save_path, _ = QFileDialog.getSaveFileName(
@@ -8914,7 +8916,7 @@ class FolderCompareDeleteApp(QMainWindow):
         workbook.save(save_path)
         self._push_undo_action(undo_payload)
         self._record_history("Export Excel", "Sukses", save_path, "success")
-        QMessageBox.information(self, APP_TITLE, f"Berhasil menyimpan Excel:\n{save_path}")
+        self.show_error_dialog("Info", f"Berhasil menyimpan Excel:\n{save_path}", "")
 
 def _forward_exception_to_app(title: str, summary: str, details: str) -> None:
     sys.stderr.write(f"{title}\n{summary}\n{details}\n")

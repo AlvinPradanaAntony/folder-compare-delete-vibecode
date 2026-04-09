@@ -2,6 +2,11 @@
 
 Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
+## [2.4.4] - 2026-04-09
+
+### Diperbarui
+- Refaktor besar-besaran: mengganti semua penggunaan dialog notifikasi standar `QMessageBox` bawaan sistem dengan dialog UI kustom internal (`show_error_dialog`, `ErrorOverlayDialog`, `SuccessOverlayDialog`, dll.) di seluruh modul aplikasi. Memberikan tampilan material peringatan/informasi yang jauh lebih menyatu, estetik, dan konsisten (*overlay* di induk Window yang sama).
+
 ## [2.4.3] - 2026-04-09
 
 ### Diperbarui
@@ -13,6 +18,11 @@ Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 ### Diperbaiki
 
 - Memperbaiki isu kegagalan _restart_ aplikasi pad platform Windows, Linux, dan macOS setelah update sukses akibat konflik environment variables PyInstaller (`_MEIPASS`, `_PYIBoot_SPLASH`) yang tersisa.
+
+<details>
+<summary><strong>Lihat Riwayat Versi Sebelumnya</strong></summary>
+
+<br>
 
 ## [2.4.1] - 2026-04-09
 
@@ -48,11 +58,6 @@ Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
 - Penyesuaian pada kolom riwayat/history `("Nama File")` untuk menampilkan detail yang lebih kontekstual pada nama file.
 - Penyelesaian masalah status sinkronisasi tabel (label yang tersalin/terpindah) sehingga tak lagi memerlukan scan manual berulang kali.
-
-<details>
-<summary><strong>Lihat Riwayat Versi Sebelumnya</strong></summary>
-
-<br>
 
 ## [2.2.0] - 2026-04-04
 
