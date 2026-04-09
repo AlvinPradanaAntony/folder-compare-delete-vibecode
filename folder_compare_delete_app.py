@@ -57,7 +57,7 @@ except ImportError as exc:
 
 
 APP_TITLE = "Folder Compare & Delete"
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.4.3"
 APP_DEVELOPER = "Tonzdev"
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 BG_COLOR = "#f4f7fb"
@@ -4492,6 +4492,8 @@ class FolderCompareDeleteApp(QMainWindow):
         self.trash_table.setMinimumHeight(300)
         self._configure_trash_table_columns(apply_default_widths=True)
         self.trash_table.cellClicked.connect(self._toggle_trash_row_check)
+        self.trash_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.trash_table.customContextMenuRequested.connect(self._show_trash_table_context_menu)
 
         self.trash_stack_host = QWidget()
         self.trash_stack = QStackedLayout(self.trash_stack_host)
@@ -7111,10 +7113,18 @@ class FolderCompareDeleteApp(QMainWindow):
     def restore_trash_entries(self, entry_ids: List[str]) -> None:
         selected_entries = [entry for entry_id in entry_ids if (entry := self._find_trash_entry(entry_id)) is not None]
         if not selected_entries:
-            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari trash untuk dipulihkan.")
+            self.show_error_dialog(
+                "Peringatan", 
+                "Pilih minimal satu file dari trash.", 
+                "Anda harus mencentang kotak di sebelah file yang ingin dipulihkan."
+            )
             return
         if self.undo_thread and self.undo_thread.is_alive():
-            QMessageBox.information(self, APP_TITLE, "Undo sebelumnya masih berjalan.")
+            self.show_error_dialog(
+                "Perhatian", 
+                "Proses Masih Berjalan", 
+                "Mohon tunggu hingga aksi sebelumnya selesai sebelum memulihkan file lain."
+            )
             return
 
         if len(selected_entries) == 1:
@@ -7157,17 +7167,41 @@ class FolderCompareDeleteApp(QMainWindow):
     def restore_selected_trash_entries(self) -> None:
         self.restore_trash_entries(self._selected_trash_entry_ids())
 
-    def delete_selected_trash_entries_permanently(self) -> None:
-        entry_ids = self._selected_trash_entry_ids()
+    def delete_selected_trash_entries_permanently(self, force_entry_ids: Optional[List[str]] = None) -> None:
+        if isinstance(force_entry_ids, list):
+            entry_ids = force_entry_ids
+        else:
+            entry_ids = self._selected_trash_entry_ids()
+            
         if not entry_ids:
-            QMessageBox.information(self, APP_TITLE, "Pilih minimal satu file dari trash untuk dihapus permanen.")
+            self.show_error_dialog(
+                "Peringatan",
+                "Pilih minimal satu file dari Trash Internal.",
+                "Centang kotak di sisi kiri tabel di samping nama file untuk memilih item."
+            )
             return
 
-        if QMessageBox.question(
+        entries = [self._find_trash_entry(eid) for eid in entry_ids]
+        entries = [e for e in entries if e is not None]
+        preview = "\n".join(f"[{Path(e.original_path).name}] {e.original_path}" for e in entries[:10])
+        extra_details = "" if len(entries) <= 10 else f"\n... dan {len(entries) - 10} file lainnya"
+        
+        is_all_entries = len(entry_ids) == len(self.trash_entries) and len(self.trash_entries) > 0
+        dialog_title = "Kosongkan Trash Internal" if is_all_entries else "Hapus Permanen dari Trash"
+
+        confirm_dialog = ConfirmOverlayDialog(
             self,
-            "Hapus Permanen dari Trash",
-            f"{len(entry_ids)} file di trash internal akan dihapus permanen. Lanjutkan?",
-        ) != QMessageBox.StandardButton.Yes:
+            dialog_title,
+            f"{len(entry_ids)} file di trash internal akan dihapus secara permanen.",
+            f"{preview}{extra_details}",
+            detail_title="Daftar File",
+            confirm_button_text="Hapus Permanen",
+            confirm_footnote="Tindakan ini tidak dapat dibatalkan atau dikembalikan.",
+        )
+        
+        confirm_dialog.confirmRequested.connect(confirm_dialog.accept)
+        
+        if confirm_dialog.exec() != QDialog.Accepted:
             return
 
         deleted_count = 0
@@ -7215,13 +7249,15 @@ class FolderCompareDeleteApp(QMainWindow):
 
     def delete_all_trash_entries_permanently(self) -> None:
         if not self.trash_entries:
-            QMessageBox.information(self, APP_TITLE, "Trash internal sudah kosong.")
+            self.show_error_dialog(
+                "Info",
+                "Trash internal sudah kosong.",
+                "Tidak ada file yang bisa dihapus."
+            )
             return
-        for row_index in range(self.trash_table.rowCount()):
-            item = self.trash_table.item(row_index, 0)
-            if item is not None:
-                item.setCheckState(Qt.Checked)
-        self.delete_selected_trash_entries_permanently()
+
+        all_entry_ids = [entry.entry_id for entry in self.trash_entries]
+        self.delete_selected_trash_entries_permanently(all_entry_ids)
 
     def _create_undo_action_dir(self, label: str) -> Path:
         safe_label = "".join(char if char.isalnum() else "_" for char in label.lower()).strip("_") or "aksi"
@@ -7595,6 +7631,33 @@ class FolderCompareDeleteApp(QMainWindow):
         action = menu.exec(self.results_table.viewport().mapToGlobal(pos))
         if action == reveal_action:
             self._reveal_in_explorer(str(result.target_path))
+
+    def _show_trash_table_context_menu(self, pos: QPoint) -> None:
+        index = self.trash_table.indexAt(pos)
+        if not index.isValid():
+            return
+
+        # Ambil data entry_id dari kolom 0
+        entry_id_item = self.trash_table.item(index.row(), 0)
+        if not entry_id_item:
+            return
+
+        entry_id = entry_id_item.data(Qt.UserRole)
+        if not entry_id:
+            return
+
+        entry = self._find_trash_entry(str(entry_id))
+        if not entry:
+            return
+
+        menu = QMenu(self)
+        reveal_trash_action = QAction("Tampilkan File di Trash", self)
+        
+        menu.addAction(reveal_trash_action)
+
+        action = menu.exec(self.trash_table.viewport().mapToGlobal(pos))
+        if action == reveal_trash_action:
+            self._reveal_in_explorer(str(entry.trash_path))
 
     def _reveal_in_explorer(self, path: str) -> None:
         try:

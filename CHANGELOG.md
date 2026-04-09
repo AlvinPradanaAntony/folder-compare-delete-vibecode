@@ -2,6 +2,12 @@
 
 Semua perubahan penting pada proyek ini akan dicatat dalam file ini.
 
+## [2.4.3] - 2026-04-09
+
+### Diperbarui
+- Mengganti dialog `QMessageBox` bawaan sistem dengan `ConfirmOverlayDialog` dan `ErrorOverlayDialog` kustom untuk konfirmasi aksi hapus serta restore file di panel Trash Internal.
+- Menambahkan *context menu* informatif pada klik kanan di tabel Trash Internal untuk menampilkan/membuka file (*Reveal in Explorer*) yang ada di dalam tempat sampah aplikasi.
+
 ## [2.4.2] - 2026-04-09
 
 ### Diperbaiki
